@@ -79,6 +79,28 @@ typedef struct
 } glyf_data;
 
 
+typedef struct
+{
+    point   *Points;
+    uint32_t PointCount;
+} contour;
+
+
+typedef struct contour_node contour_node;
+struct contour_node
+{
+    contour_node *Next;
+    contour       Value;
+};
+
+
+typedef struct contour_list
+{
+    contour_node *First;
+    contour_node *Last;
+} contour_list;
+
+
 #define COLOR_BLACK {.R =   0, G =   0, B =   0, A = 255}
 #define COLOR_WHITE {.R = 255, G = 255, B = 255, A = 255}
 
@@ -147,11 +169,8 @@ WriteBMP(const char *Filename, pixel *Buffer, int Width, int Height)
 
 
 static void
-RasterizePointList(point *Points, uint32_t PointCount, uint32_t GlyphSizeX, uint32_t GlyphSizeY)
+RasterizePointList(contour_list List, uint32_t GlyphSizeX, uint32_t GlyphSizeY)
 {
-    assert(Points);
-    assert(PointCount);
-
     //
     // Don't use malloc.
     //
@@ -166,48 +185,55 @@ RasterizePointList(point *Points, uint32_t PointCount, uint32_t GlyphSizeX, uint
 
     uint32_t ScanlineY    = 0;
     uint32_t SegmentCount = 0;
-    segment *Segments     = malloc((PointCount * 5) * sizeof(segment)); // A bit cryptic.
+    segment *Segments     = malloc(100 * sizeof(segment)); // This will overflow at some point. Need more meta-data to bound?
 
     assert(Segments);
 
-    uint32_t PointIdx     = 0;
     uint32_t StepCount    = 10;
     float    StepAmount   = 1.0f / StepCount;
     float    StepFraction = StepAmount;
 
-    while (PointIdx < PointCount)
+    for (contour_node *Node = List.First; Node != 0; Node = Node->Next)
     {
-        point Current = Points[PointIdx];
-        point Next    = Points[(PointIdx + 1) % PointCount];
+        contour  Contour  = Node->Value;
+        uint32_t PointIdx = 0;
 
-        if (Current.OnCurve && Next.OnCurve)
+        while(PointIdx < Contour.PointCount)
         {
-            Segments[SegmentCount++] = (segment){.Start = Current, .End = Next};
-            PointIdx += 1;
-        }
-        else
-        {
-            point Control = Next;
-            point End     = Points[(PointIdx + 2) % PointCount];
+            point Current = Contour.Points[PointIdx];
+            point Next    = Contour.Points[(PointIdx + 1) % Contour.PointCount];
 
-            point PreviousPoint = Current;
-            float StepFraction  = StepAmount;
-
-            while (StepFraction <= 1.0f)
+            if (Current.OnCurve && Next.OnCurve)
             {
-                point A = LinearInterpolatePoint(Current, Control, StepFraction);
-                point B = LinearInterpolatePoint(Control, End, StepFraction);
-                point C = LinearInterpolatePoint(A, B, StepFraction);
-
-                Segments[SegmentCount++] = (segment){.Start = PreviousPoint, .End = C};
-
-                PreviousPoint = C;
-                StepFraction += StepAmount;
+                Segments[SegmentCount++] = (segment){ .Start = Current, .End = Next };
+                PointIdx += 1;
             }
+            else
+            {
+                point Control = Next;
+                point End     = Contour.Points[(PointIdx + 2) % Contour.PointCount];
 
-            PointIdx += 2;
+                point PreviousPoint = Current;
+                float StepFraction  = StepAmount;
+
+                while (StepFraction <= 1.0f)
+                {
+                    point A = LinearInterpolatePoint(Current, Control, StepFraction);
+                    point B = LinearInterpolatePoint(Control, End, StepFraction);
+                    point C = LinearInterpolatePoint(A, B, StepFraction);
+
+                    Segments[SegmentCount++] = (segment){ .Start = PreviousPoint, .End = C };
+
+                    PreviousPoint = C;
+                    StepFraction += StepAmount;
+                }
+
+                PointIdx += 2;
+            }
         }
     }
+
+
 
     //
     // Enabling this line somehow produces better results. This doesn't make any sense as it is
@@ -222,10 +248,10 @@ RasterizePointList(point *Points, uint32_t PointCount, uint32_t GlyphSizeX, uint
     //
 
     uint32_t IntersectionCount = 0;
-    float   *Intersections     = malloc(PointCount * sizeof(float));
+    float   *Intersections     = malloc(100 * sizeof(float)); // This will overflow at some point. Need more meta-data to bound?
 
     assert(Intersections);
-    memset(Intersections, 0, PointCount * sizeof(float));
+    memset(Intersections, 0, 100 * sizeof(float));
 
 
     while (ScanlineY < GlyphSizeY)
@@ -391,122 +417,12 @@ int main()
                 LogicalPointIndex = 0;
                 PhysicalFlagIndex = 0;
 
-                point *Points = malloc(LogicalPointCount * sizeof(point));
-                assert(Points);
 
-                uint32_t CurrentX    = 0;
-                uint32_t CurrentY    = 0;
-                uint32_t XByteOffset = 0;
-                uint32_t YByteOffset = 0;
+                //
+                // Something like that is more useful.
+                //
 
-                while (LogicalPointIndex < LogicalPointCount)
-                {
-                    uint8_t BitFlag = Flags[PhysicalFlagIndex++];
-
-                    //
-                    // Extract all of the flags that we need.
-                    // 
-                    // TODO: Give names to these.
-                    //
-
-                    bool IsPointOnCurve         = BitFlag & 0x01;
-                    bool IsXShortVector         = BitFlag & 0x02;
-                    bool IsYShortVector         = BitFlag & 0x04;
-                    bool IsRepeated             = BitFlag & 0x08;
-                    bool IsXSameOrPositiveShort = BitFlag & 0x10;
-                    bool IsYSameOrPositiveShort = BitFlag & 0x20;
-
-                    //
-                    // We need to fill this data depending on which flags are set
-                    //
-
-                    uint8_t  XByteCount = 0;
-                    uint8_t  YByteCount = 0;
-                    int      XSign      = 1;
-                    int      YSign      = 1;
-                    uint16_t Repeat     = 1;
-
-                    if (IsXShortVector)
-                    {
-                        XByteCount = 1;
-
-                        if (!IsXSameOrPositiveShort)
-                        {
-                            XSign = -1;
-                        }
-                    }
-                    else if (!IsXSameOrPositiveShort)
-                    {
-                        XByteCount = 2;
-                    }
-
-                    if (IsYShortVector)
-                    {
-                        YByteCount = 1;
-
-                        if (!IsYSameOrPositiveShort)
-                        {
-                            YSign = -1;
-                        }
-                    }
-                    else if (!IsYSameOrPositiveShort)
-                    {
-                        YByteCount = 2;
-                    }
-
-                    if (IsRepeated)
-                    {
-                        Repeat = Flags[PhysicalFlagIndex++] + 1;
-                    }
-
-
-                    //
-                    // Maybe flip the Y since the bitmap Y is downwards?
-                    //
-
-
-                    for (uint32_t RepeatIdx = 0; RepeatIdx < Repeat; ++RepeatIdx)
-                    {
-                        short DeltaX = 0;
-                        short DeltaY = 0;
-
-                        if (XByteCount == 1)
-                        {
-                            DeltaX = XSign * (*(XCoordinate + XByteOffset));
-                        }
-                        else if (XByteCount == 2)
-                        {
-                            DeltaX = *(short *)(XCoordinate + XByteOffset);
-                        }
-
-                        if (YByteCount == 1)
-                        {
-                            DeltaY = YSign * (*(YCoordinate + YByteOffset));
-                        }
-                        else if (YByteCount == 2)
-                        {
-                            DeltaY = *(short *)(YCoordinate + YByteOffset);
-                        }
-
-                        //
-                        // This can't underflow right? Assuming parsing is correct. Maybe just use signed stuff and assert
-                        // just to be sure.
-                        //
-
-                        CurrentX += DeltaX;
-                        CurrentY += DeltaY;
-
-                        point *Point = Points + (LogicalPointIndex + RepeatIdx);
-                        Point->X       = (CurrentX - Header->MinX) * Scale;
-                        Point->Y       = (CurrentY - Header->MinY) * Scale;
-                        Point->OnCurve = IsPointOnCurve;
-
-                        XByteOffset += XByteCount;
-                        YByteOffset += YByteCount;
-                    }                    
-
-                    LogicalPointIndex += Repeat;
-                }
+                contour_list List = {};
 
                 //
                 // Have to add another pass, maybe it's possible to do it in a single pass. I don't really know.
@@ -515,43 +431,191 @@ int main()
                 // Also, don't use malloc.
                 //
 
+
                 uint32_t ExpandedPointCount = 0;
                 point   *ExpandedPoints     = malloc(LogicalPointCount * 2 * sizeof(point));
-
                 assert(ExpandedPoints);
 
-                //
-                // First have to check the "loop" between the last and the first element. If both are off-curve
-                // we add an on-curve point as our new start.
-                //
 
-                point First = Points[0];
-                point Last  = Points[LogicalPointCount - 1];
+                uint32_t CurrentX    = 0;
+                uint32_t CurrentY    = 0;
+                uint32_t XByteOffset = 0;
+                uint32_t YByteOffset = 0;
 
-                if (!First.OnCurve && !Last.OnCurve)
+                uint32_t ContourStart = 0;
+                for (uint32_t ContourIdx = 0; ContourIdx < Header->NumberOfContours; ++ContourIdx)
                 {
-                    ExpandedPoints[ExpandedPointCount++] = GetMidwayPoint(First, Last);
-                }
-                ExpandedPoints[ExpandedPointCount++] = First;
+                    int32_t  ContourEnd   = EndPointsOfContours[ContourIdx];
+                    uint32_t ContourCount = ContourEnd - ContourStart + 1;
 
-                for (uint32_t PointIdx = 1; PointIdx < LogicalPointCount; ++PointIdx)
-                {
-                    point Current = Points[PointIdx];
-                    point Last    = Points[PointIdx - 1];
+                    contour_node *Node = malloc(sizeof(contour_node));
+                    Node->Value.Points     = malloc(ContourCount * 2 * sizeof(point));
+                    Node->Value.PointCount = 0;
+                    Node->Next             = 0;
 
-                    if (!Current.OnCurve && !Last.OnCurve)
+                    contour *Contour = &Node->Value;
+
+                    if (!List.First)
                     {
-                        ExpandedPoints[ExpandedPointCount++] = GetMidwayPoint(Last, Current);
+                        List.First = Node;
+                        List.Last  = Node;
+                    }
+                    else
+                    {
+                        List.Last->Next = Node;
+                        List.Last       = Node;
                     }
 
-                    ExpandedPoints[ExpandedPointCount++] = Current;
-                }
+                    for (uint32_t _ = 0; _ < ContourCount; _++)
+                    {
+                        uint8_t BitFlag = Flags[PhysicalFlagIndex++];
 
+                        //
+                        // Extract all of the flags that we need.
+                        // 
+                        // TODO: Give names to these.
+                        //
+
+                        bool IsPointOnCurve = BitFlag & 0x01;
+                        bool IsXShortVector = BitFlag & 0x02;
+                        bool IsYShortVector = BitFlag & 0x04;
+                        bool IsRepeated = BitFlag & 0x08;
+                        bool IsXSameOrPositiveShort = BitFlag & 0x10;
+                        bool IsYSameOrPositiveShort = BitFlag & 0x20;
+
+                        //
+                        // We need to fill this data depending on which flags are set
+                        //
+
+                        uint8_t  XByteCount = 0;
+                        uint8_t  YByteCount = 0;
+                        int      XSign = 1;
+                        int      YSign = 1;
+                        uint16_t Repeat = 1;
+
+                        if (IsXShortVector)
+                        {
+                            XByteCount = 1;
+
+                            if (!IsXSameOrPositiveShort)
+                            {
+                                XSign = -1;
+                            }
+                        }
+                        else if (!IsXSameOrPositiveShort)
+                        {
+                            XByteCount = 2;
+                        }
+
+                        if (IsYShortVector)
+                        {
+                            YByteCount = 1;
+
+                            if (!IsYSameOrPositiveShort)
+                            {
+                                YSign = -1;
+                            }
+                        }
+                        else if (!IsYSameOrPositiveShort)
+                        {
+                            YByteCount = 2;
+                        }
+
+                        if (IsRepeated)
+                        {
+                            Repeat = Flags[PhysicalFlagIndex++] + 1;
+                        }
+
+
+                        //
+                        // Maybe flip the Y since the bitmap Y is downwards?
+                        //
+
+
+                        for (uint32_t RepeatIdx = 0; RepeatIdx < Repeat; ++RepeatIdx)
+                        {
+                            short DeltaX = 0;
+                            short DeltaY = 0;
+
+                            if (XByteCount == 1)
+                            {
+                                DeltaX = XSign * (*(XCoordinate + XByteOffset));
+                            }
+                            else if (XByteCount == 2)
+                            {
+                                DeltaX = *(short *)(XCoordinate + XByteOffset);
+                            }
+
+                            if (YByteCount == 1)
+                            {
+                                DeltaY = YSign * (*(YCoordinate + YByteOffset));
+                            }
+                            else if (YByteCount == 2)
+                            {
+                                DeltaY = *(short *)(YCoordinate + YByteOffset);
+                            }
+
+                            //
+                            // This can't underflow right? Assuming parsing is correct. Maybe just use signed stuff and assert
+                            // just to be sure.
+                            //
+
+                            CurrentX += DeltaX;
+                            CurrentY += DeltaY;
+
+                            point *Point = Contour->Points + (RepeatIdx + Contour->PointCount++);
+                            Point->X       = (CurrentX - Header->MinX) * Scale;
+                            Point->Y       = (CurrentY - Header->MinY) * Scale;
+                            Point->OnCurve = IsPointOnCurve;
+
+                            XByteOffset += XByteCount;
+                            YByteOffset += YByteCount;
+                        }
+
+                        LogicalPointIndex += Repeat;
+                    }
+
+
+                    //
+                    // This needs to rewrite points in place maybe? Kind of annoying to deal with.
+                    // Could also replace the pointer.
+                    //
+
+                    // point Start = Contour->Points[0];
+                    // point End   = Contour->Points[Contour->PointCount - 1];
+                    // if (!Start.OnCurve && !End.OnCurve)
+                    // {
+                    //     ExpandedPoints[ExpandedPointCount++] = GetMidwayPoint(End, Start);
+                    // }
+                    // ExpandedPoints[ExpandedPointCount++] = Start;
+                       
+                    // for (uint32_t PointIdx = 1; PointIdx < ContourCount; ++PointIdx)
+                    // {
+                    //     point Current = Points[PointIdx + ContourStart];
+                    //     point Last    = Points[PointIdx + ContourStart - 1];
+                       
+                    //     if (!Current.OnCurve && !Last.OnCurve)
+                    //     {
+                    //         ExpandedPoints[ExpandedPointCount++] = GetMidwayPoint(Last, Current);
+                    //     }
+                       
+                    //     ExpandedPoints[ExpandedPointCount++] = Current;
+                    // }
+
+
+                    ContourStart = ContourEnd + 1;
+                }
 
                 uint32_t GlyphSizeX = (uint32_t)(ceilf(Scale * (Header->MaxX - Header->MinX)));
                 uint32_t GlyphSizeY = (uint32_t)(ceilf(Scale * (Header->MaxY - Header->MinY)));
 
-                RasterizePointList(ExpandedPoints, ExpandedPointCount, GlyphSizeX, GlyphSizeY);
+
+                //for (uint32_t Idx = 0; Idx < ExpandedPointCount; ++Idx)
+                //{
+                //    printf("Point: (%f, %f)", ExpandedPoints[Idx].X, ExpandedPoints[Idx].Y);
+                //}
+
+                RasterizePointList(List, GlyphSizeX, GlyphSizeY);
             }
         }
     }
