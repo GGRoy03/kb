@@ -1453,6 +1453,9 @@
 #  ifndef kbts_b32
 #    define kbts_b32 int
 #  endif
+#  ifndef kbts_f32
+#    define kbts_f32 float
+#  endif
 
 #  ifndef KB_TEXT_SHAPE_POINTER_SIZE
 #    if defined(i386) || defined(__i386__) || defined(_M_IX86) || defined(_M_ARM) || defined(__arm__) || defined(__x86) || (defined(__APPLE__) && defined(__ppc)) || \
@@ -3866,6 +3869,8 @@ KBTS_EXPORT int kbts_ScriptIsComplex(kbts_script Script);
 KBTS_EXPORT kbts_script kbts_ScriptTagToScript(kbts_script_tag Tag);
 
 #endif
+
+#define KB_TEXT_SHAPE_IMPLEMENTATION
 
 #ifdef KB_TEXT_SHAPE_IMPLEMENTATION
 #ifdef _MSC_VER
@@ -16849,14 +16854,24 @@ typedef struct kbts__os2
     kbts_u16 UpperOpticalPointSize;
 } kbts__os2;
 
-typedef struct kbts__glyph_header
+typedef struct kbts__glyf_header
 {
     kbts_s16 NumberOfContours;
     kbts_s16 MinX;
     kbts_s16 MinY;
     kbts_s16 MaxX;
     kbts_s16 MaxY;
-} kbts__glyph_header;
+} kbts__glyf_header;
+
+typedef struct
+{
+    kbts_u16 *EndPointOfContours;
+    kbts_u16 *InstructionLength;
+    kbts_u8 *Instructions;
+    kbts_u8 *Flags;
+    kbts_u8 *XCoordinates;
+    kbts_u8 *YCoordinates;
+} kbts__glyf;
 
 typedef struct kbts__lang_tag_record
 {
@@ -20358,7 +20373,7 @@ typedef struct kbts__sequence_lookup_result
     // This is specified _nowhere_ in the docs, BUT some sequence lookups have 0 records, and exist just to prevent the
     // next lookups from executing.
     // So, checking if we got any records is not enough to figure out whether we need to "apply" this lookup.
-    // We need to have an explicit bool as well.
+    // We need to have an explicit kbts_b32 as well.
     // Sigh.
     kbts_b32 Matched;
 
@@ -28214,7 +28229,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                         continue;
                     }
 
-                    kbts__glyph_header *GlyphHeader = KBTS__POINTER_OFFSET(kbts__glyph_header, Glyf, OffsetFromGlyfStart);
+                    kbts__glyf_header *GlyphHeader = KBTS__POINTER_OFFSET(kbts__glyf_header, Glyf, OffsetFromGlyfStart);
                     kbts__ByteSwapArray16Unchecked((kbts_u16 *)GlyphHeader, 5);
 
                     // There are 3 cases:
@@ -28252,9 +28267,9 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                         {
                             kbts_u8 ByteFlag = Flags[PhysicalFlagIndex++];
 
-                            kbts_u16 Repeat     = (ByteFlag & 0x08) ? Flags[PhysicalFlagIndex++] + 1 : 1;;
                             kbts_u8  XByteCount = (ByteFlag & 0x02) ? 1 : ((ByteFlag & 0x10) ? 0 : 2);
                             kbts_u8  YByteCount = (ByteFlag & 0x04) ? 1 : ((ByteFlag & 0x20) ? 0 : 2);
+                            kbts_u16 Repeat     = (ByteFlag & 0x08) ? Flags[PhysicalFlagIndex++] + 1 : 1;
 
                             XCoordinatePhysicalCount += Repeat * XByteCount;
                             YCoordinatePhysicalCount += Repeat * YByteCount;
@@ -31124,6 +31139,636 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromSystem(kbts_shape_context *Context,
     }
 
     return Result;
+}
+
+//
+// Rasterizer Basic Implementation
+//
+
+// Context->RunFont
+
+
+typedef struct
+{
+    kbts_f32 X;
+    kbts_f32 Y;
+    kbts_b32 OnCurve;
+} kbts__glyph_point;
+
+
+//
+// Store ranges of those somehow... Probably inside the context. Then as we raster we look-up which range the
+// glyph falls in. This is efficient, because it's either the glyph is already in the range, or it's the next one. If the glyph
+// is in either, it fallbacks to the defualt state.
+// 
+
+typedef struct
+{
+    kbts_u32 StartInclusive;
+    kbts_u32 EndInclusive;
+    kbts_u32 FontSize;
+} kbts_raster_parameters;
+
+
+static kbts_raster_parameters GlobalDefaultRasterParams =
+{
+    .FontSize = 32,
+};
+
+static kbts_raster_parameters GlobalRasterParams;
+
+
+static kbts_b32 kbts__GlyphIndexIsInRasterRange(kbts_raster_parameters *Params, kbts_u32 GlyphIndex)
+{
+    kbts_b32 Result = GlyphIndex >= Params->StartInclusive && GlyphIndex < Params->EndInclusive;
+    return Result;
+}
+
+
+static kbts_raster_parameters *kbts__GetRasterParamsFromGlyphIndex(kbts_u32 GlyphIndex)
+{
+    kbts_raster_parameters *Result = 0;
+
+    if (kbts__GlyphIndexIsInRasterRange(&GlobalRasterParams, GlyphIndex))
+    {
+        Result = &GlobalRasterParams;
+    }
+    else
+    {
+        Result = &GlobalDefaultRasterParams;
+    }
+    
+    return Result;
+}
+
+
+typedef struct
+{
+    kbts_s16 MinX;
+    kbts_s16 MinY;
+    kbts_s16 MaxX;
+    kbts_s16 MaxY;
+} kbts__glyph_bounding_box;
+
+
+typedef struct
+{
+    kbts__glyph_point *Points;
+    kbts_u32 PointCount;
+} kbts__glyph_contour;
+
+
+typedef struct kbts__glyph_contour_node kbts__glyph_contour_node;
+struct kbts__glyph_contour_node
+{
+    kbts__glyph_contour_node *Next;
+    kbts__glyph_contour Value;
+};
+
+
+typedef struct kbts__glyph_contour_list
+{
+    kbts__glyph_contour_node *First;
+    kbts__glyph_contour_node *Last;
+    kbts__glyph_bounding_box BoundingBox;
+} kbts__glyph_contour_list;
+
+
+static kbts__glyf kbts__LoadGlyfTable(kbts_u16 GlyphId, kbts_font *Font)
+{
+    kbts__glyf Result = {};
+
+    if (Font)
+    {
+        kbts_blob_table HeadTable = Font->Blob->Tables[KBTS_BLOB_TABLE_ID_HEAD];
+        kbts_blob_table LocaTable = Font->Blob->Tables[KBTS_BLOB_TABLE_ID_LOCA];
+        kbts_blob_table GlyfTable = Font->Blob->Tables[KBTS_BLOB_TABLE_ID_GLYF];
+
+        if (HeadTable.Length && LocaTable.Length && GlyfTable.Length)
+        {
+            kbts__head *Head = KBTS__POINTER_OFFSET(kbts__head, Font->Blob, HeadTable.OffsetFromStartOfFile);
+            void *Glyf = KBTS__POINTER_OFFSET(void, Font->Blob, GlyfTable.OffsetFromStartOfFile);
+            void *Loca = KBTS__POINTER_OFFSET(void, Font->Blob, LocaTable.OffsetFromStartOfFile);
+
+            //
+            // Helpers?
+            //
+
+            kbts_u32 OffsetFromGlyfStart = *((kbts_u32 *)Loca + GlyphId);
+            if (Head->IndexToLocFormat == 0)
+            {
+                OffsetFromGlyfStart = (*((kbts_u16 *)Loca + (GlyphId))) * 2;
+            }
+
+            kbts__glyf_header *GlyphHeader = KBTS__POINTER_OFFSET(kbts__glyf_header, Glyf, OffsetFromGlyfStart);
+            kbts_u16 *EndPointsContours = KBTS__POINTER_AFTER(kbts_u16, GlyphHeader);
+            kbts_u16 *InstructionLength = EndPointsContours + GlyphHeader->NumberOfContours;
+            kbts_u8 *Instructions = KBTS__POINTER_AFTER(kbts_u8, InstructionLength);
+            kbts_u8 *Flags = KBTS__POINTER_OFFSET(kbts_u8, Instructions, *InstructionLength);
+
+            kbts_u16 LogicalPointCount = EndPointsContours[GlyphHeader->NumberOfContours - 1] + 1;
+            kbts_u32 LogicalPointIndex = 0;
+            kbts_u32 PhysicalFlagIndex = 0;
+            kbts_u32 XCoordinatePhysicalCount = 0;
+
+            while (LogicalPointIndex < LogicalPointCount)
+            {
+                kbts_u8 ByteFlag = Flags[PhysicalFlagIndex++];
+
+                kbts_u8  XByteCount = (ByteFlag & 0x02) ? 1 : ((ByteFlag & 0x10) ? 0 : 2);
+                kbts_u16 Repeat = (ByteFlag & 0x08) ? Flags[PhysicalFlagIndex++] + 1 : 1;
+
+                XCoordinatePhysicalCount += Repeat * XByteCount;
+                LogicalPointIndex += Repeat;
+            }
+
+            kbts_u8 *XCoordinates = Flags + PhysicalFlagIndex;
+            kbts_u8 *YCoordinates = XCoordinates + XCoordinatePhysicalCount;
+
+            Result.EndPointOfContours = EndPointsContours;
+            Result.InstructionLength = InstructionLength;
+            Result.Instructions = Instructions;
+            Result.Flags = Flags;
+            Result.XCoordinates = XCoordinates;
+            Result.YCoordinates = YCoordinates;
+        }
+    }
+
+    return Result;
+}
+
+
+static kbts__glyph_contour_list *kbts__ExtractContoursFromGlyph(kbts_glyph *Glyph, kbts_font *Font, kbts_arena *Arena)
+{
+    kbts__glyph_contour_list *List = kbts__PushType(Arena, kbts__glyph_contour_list);
+    List->First = 0;
+    List->Last = 0;
+
+    if (Glyph && Font && Arena)
+    {
+        //
+        // Maybe move this outside? Doesn't matter.
+        //
+
+        kbts_raster_parameters *RasterParams = kbts__GetRasterParamsFromGlyphIndex(0);
+        KBTS_ASSERT(RasterParams);
+
+        kbts_blob_table HeadTable = Font->Blob->Tables[KBTS_BLOB_TABLE_ID_HEAD];
+        kbts_blob_table GlyfTable = Font->Blob->Tables[KBTS_BLOB_TABLE_ID_GLYF];
+        kbts_blob_table LocaTable = Font->Blob->Tables[KBTS_BLOB_TABLE_ID_LOCA];
+
+        if (HeadTable.Length && GlyfTable.Length && LocaTable.Length)
+        {
+            //
+            // TODO: Use the helpers instead.
+            //
+
+            kbts__head *HeadTableData = (kbts__head *)((kbts_u8 *)Font->Blob + HeadTable.OffsetFromStartOfFile);
+            float FontPixelScale = RasterParams->FontSize / (float)HeadTableData->UnitsPerEm;
+
+            void *LocaTableData = (kbts_u8 *)Font->Blob + LocaTable.OffsetFromStartOfFile;
+            kbts_u32 ByteOffset = 0;
+            if (HeadTableData->IndexToLocFormat == 0)
+            {
+                ByteOffset = (*((kbts_u16 *)LocaTableData + Glyph->Id)) * 2;
+            }
+            else if (HeadTableData->IndexToLocFormat == 1)
+            {
+                ByteOffset = *((kbts_u32 *)LocaTableData + Glyph->Id);
+            }
+
+            if (ByteOffset < GlyfTable.Length)
+            {
+                void *GlyfTableData = (kbts_u8 *)Font->Blob + GlyfTable.OffsetFromStartOfFile;
+
+                //
+                // @Duplication:
+                // I already wrote something similar in the byte-swapper which we could probably use again.
+                //
+
+                kbts__glyf_header *Header = (kbts__glyf_header *)((kbts_u8 *)GlyfTableData + ByteOffset);
+                kbts__glyf Glyf = kbts__LoadGlyfTable(Glyph->Id, Font);
+
+                List->BoundingBox.MinX = FontPixelScale * Header->MinX;
+                List->BoundingBox.MaxX = FontPixelScale * Header->MaxX;
+                List->BoundingBox.MinY = FontPixelScale * Header->MinY;
+                List->BoundingBox.MaxY = FontPixelScale * Header->MaxY;
+
+                kbts_u32 CurrentX = 0;
+                kbts_u32 CurrentY = 0;
+                kbts_u32 XByteOffset = 0;
+                kbts_u32 YByteOffset = 0;
+                kbts_u32 PhysicalFlagIndex = 0;
+                kbts_u32 LogicalPointIndex = 0;
+
+                kbts_u32 ContourStart = 0;
+                KBTS__FOR(ContourIdx, 0, Header->NumberOfContours)
+                {
+                    kbts_u32 ContourEnd = Glyf.EndPointOfContours[ContourIdx];
+                    kbts_u32 ContourCount = ContourEnd - ContourStart + 1;
+
+                    kbts__glyph_contour_node *Node = kbts__PushType(Arena, kbts__glyph_contour_node);
+                    Node->Value.Points = kbts__PushArray(Arena, kbts__glyph_point, ContourCount); // COULD OVERFLOW AS WE WRITE?
+                    Node->Value.PointCount = 0;
+                    Node->Next = 0;
+
+                    kbts__glyph_contour *Contour = &Node->Value;
+
+                    if (!List->First)
+                    {
+                        List->First = Node;
+                        List->Last = Node;
+                    }
+                    else
+                    {
+                        List->Last->Next = Node;
+                        List->Last = Node;
+                    }
+
+                    KBTS__FOR(_, 0, ContourCount)
+                    {
+                        kbts_u8 BitFlag = Glyf.Flags[PhysicalFlagIndex++];
+
+                        kbts_u8 XByteCount = BitFlag & 0x02 ? 1 : BitFlag & 0x10 ? 0 : 2;
+                        kbts_u8 YByteCount = BitFlag & 0x04 ? 1 : BitFlag & 0x20 ? 0 : 2;
+                        kbts_u16 XSign = 1;
+                        kbts_u16 YSign = 1;
+
+                        if (XByteCount == 1)
+                        {
+                            if (!(BitFlag & 0x10))
+                            {
+                                XSign = -1;
+                            }
+                        }
+
+                        if (YByteCount == 1)
+                        {
+                            if (!(BitFlag & 0x20))
+                            {
+                                YSign = -1;
+                            }
+                        }
+
+                        kbts_u16 RepeatCount = 1;
+                        if (BitFlag & 0x08)
+                        {
+                            RepeatCount = Glyf.Flags[PhysicalFlagIndex++];
+                        }
+
+                        kbts_b32 IsPointOnCurve = BitFlag & 0x01;
+
+                        //
+                        // Maybe flip the Y since the bitmap Y is downwards?
+                        //
+
+                        KBTS__FOR(RepeatIdx, 0, RepeatCount)
+                        {
+                            kbts_s16 DeltaX = 0;
+                            kbts_s16 DeltaY = 0;
+
+                            //
+                            // BUG:
+                            // This is now wrong. The pointer aritmethic is just not correct since XCoordinate
+                            // is now an union of size 2 bytes.
+                            //
+
+                            if (XByteCount == 1)
+                            {
+                                DeltaX = XSign * (*(Glyf.XCoordinates + XByteOffset));
+                            }
+                            else if (XByteCount == 2)
+                            {
+                                DeltaX = *(kbts_s16 *)(Glyf.XCoordinates + XByteOffset);
+                            }
+
+                            if (YByteCount == 1)
+                            {
+                                DeltaY = YSign * (*(Glyf.YCoordinates + YByteOffset));
+                            }
+                            else if (YByteCount == 2)
+                            {
+                                DeltaY = *(kbts_s16 *)(Glyf.YCoordinates + YByteOffset);
+                            }
+
+                            //
+                            // This can't underflow right? Assuming parsing is correct. Maybe just use signed stuff and assert
+                            // just to be sure.
+                            //
+
+                            CurrentX += DeltaX;
+                            CurrentY += DeltaY;
+
+                            kbts__glyph_point *Point = Contour->Points + (RepeatIdx + Contour->PointCount++);
+                            Point->X = (CurrentX - Header->MinX) * FontPixelScale;
+                            Point->Y = (CurrentY - Header->MinY) * FontPixelScale;
+                            Point->OnCurve = IsPointOnCurve;
+
+                            XByteOffset += XByteCount;
+                            YByteOffset += YByteCount;
+                        }
+
+                        LogicalPointIndex += RepeatCount;
+                    }
+
+                    ContourStart = ContourEnd + 1;
+                }
+            }
+        }
+    }
+
+    return List;
+}
+
+
+KBTS_EXPORT void kbts_RasterSetState(kbts_shape_context *Context, kbts_raster_parameters RasterParams)
+{
+    // I have to find the glyph starting at 'start' and ending at 'end'
+    // Should we accept the run instead? Or is it too hard to do in the run?
+    // I mean.... Uhm...
+
+    //
+    // I cannot find a better way than using either a glyph iterator or just raw-dogging the linked-list.
+    // So we could iterate the linked list and find those things. Now....
+    // What do we even store. Because you have to map ranges anyways. No this is not right.
+    // What you'd do is: store the range -> lookup given the glyph index? So we'd need some kind of glyph index if it's not there.
+    //
+
+    //
+    // I think the only thing we'd actually do here is to allocate the raster params inside the context.
+    // And do basic error checking stuff.
+    //
+
+    GlobalRasterParams = RasterParams;
+}
+
+
+typedef struct
+{
+    kbts__glyph_point Start;
+    kbts__glyph_point End;
+} kbts__glyph_segment;
+
+
+typedef struct
+{
+    kbts__glyph_segment *Segments;
+    kbts_u32 SegmentCount;
+} kbts__glyph_segment_buffer;
+
+
+static kbts_f32 kbts__LinearInterpolate(kbts_f32 A, kbts_f32 B, kbts_f32 T)
+{
+    kbts_f32 Result = A + (T * (B - A));
+    return Result;
+}
+
+
+static kbts__glyph_point kbts__LinearInterpolatePoint(kbts__glyph_point A, kbts__glyph_point B, kbts_f32 T)
+{
+    kbts__glyph_point Result =
+    {
+        .X = A.X + (T * (B.X - A.X)),
+        .Y = A.Y + (T * (B.Y - A.Y)),
+    };
+
+    return Result;
+}
+
+
+static kbts__glyph_segment_buffer kbts__ConstructSegmentsFromContourList(kbts__glyph_contour_list *List, kbts_u32 StepCount, kbts_arena *Arena)
+{
+    KBTS_ASSERT(List);
+    KBTS_ASSERT(StepCount != 0);
+    KBTS_ASSERT(Arena);
+
+    kbts__glyph_segment_buffer Result = {};
+
+    //
+    // This might not be right in some cases. Need to assert for now and fix if it's a problem.
+    // 
+
+    kbts_u32 SegmentCount = 0;
+    for (kbts__glyph_contour_node *Node = List->First; Node != 0; Node = Node->Next)
+    {
+        SegmentCount += Node->Value.PointCount + 1;
+    }
+
+    Result.Segments = kbts__PushArray(Arena, kbts__glyph_segment, SegmentCount);
+
+    kbts_f32 StepAmount = 1.0f / StepCount;
+    kbts_f32 StepFraction = StepAmount;
+
+    for (kbts__glyph_contour_node *Node = List->First; Node != 0; Node = Node->Next)
+    {
+        kbts__glyph_contour Contour = Node->Value;
+        kbts_u32 PointIdx = 0;
+    
+        while (PointIdx < Contour.PointCount)
+        {
+            KBTS_ASSERT(Result.SegmentCount < SegmentCount);
+
+            kbts__glyph_point Current = Contour.Points[PointIdx];
+            kbts__glyph_point Next = Contour.Points[(PointIdx + 1) % Contour.PointCount];
+    
+            if (Current.OnCurve && Next.OnCurve)
+            {
+                Result.Segments[Result.SegmentCount++] = (kbts__glyph_segment){ .Start = Current, .End = Next };
+                PointIdx += 1;
+            }
+            else
+            {
+                kbts__glyph_point Control = Next;
+                kbts__glyph_point End = Contour.Points[(PointIdx + 2) % Contour.PointCount];
+    
+                kbts__glyph_point PreviousPoint = Current;
+                float StepFraction = StepAmount;
+    
+                while (StepFraction <= 1.0f)
+                {
+                    kbts__glyph_point A = kbts__LinearInterpolatePoint(Current, Control, StepFraction);
+                    kbts__glyph_point B = kbts__LinearInterpolatePoint(Control, End, StepFraction);
+                    kbts__glyph_point C = kbts__LinearInterpolatePoint(A, B, StepFraction);
+    
+                    Result.Segments[Result.SegmentCount++] = (kbts__glyph_segment){ .Start = PreviousPoint, .End = C };
+    
+                    PreviousPoint = C;
+                    StepFraction += StepAmount;
+                }
+    
+                PointIdx += 2;
+            }
+        }
+    }
+
+    return Result;
+}
+
+typedef struct
+{
+    kbts__glyph_point *Intersections;
+    kbts_u32 IntersectionCount;
+} kbts__intersection_buffer;
+
+
+static kbts__intersection_buffer kbts__GenerateIntersectionPointsFromSegments(kbts__glyph_segment_buffer Buffer, kbts__glyph_bounding_box BoundingBox, kbts_arena *Arena)
+{
+    KBTS_ASSERT(Arena);
+    KBTS_ASSERT(Buffer.Segments);
+
+    kbts__intersection_buffer Result = {};
+
+    kbts_u32 SizeX = (kbts_u32)(BoundingBox.MaxX - BoundingBox.MinX);
+    kbts_u32 SizeY = (kbts_u32)(BoundingBox.MaxY - BoundingBox.MinY);
+    kbts_u32 ScanlineY = 0;
+
+    KBTS_ASSERT(SizeX > 0);
+    KBTS_ASSERT(SizeY > 0);
+
+    Result.Intersections = kbts__PushArray(Arena, kbts__glyph_point, SizeX * SizeY);
+    KBTS_ASSERT(Result.Intersections);
+
+    while (ScanlineY < SizeY)
+    {
+        kbts_u32 IntersectionBeforeThisLine = Result.IntersectionCount;
+
+        for (kbts_u32 SegmentIdx = 0; SegmentIdx < Buffer.SegmentCount; ++SegmentIdx)
+        {
+            kbts__glyph_segment Segment = Buffer.Segments[SegmentIdx];
+
+            float HeightDifference = Segment.End.Y - Segment.Start.Y;
+            if (HeightDifference != 0.0f)
+            {
+                float HeightDistance = ScanlineY - Segment.Start.Y;
+                float HeightFraction = HeightDistance / HeightDifference;
+
+                if (HeightFraction >= 0.0f && HeightFraction <= 1.0f)
+                {
+                    Result.Intersections[Result.IntersectionCount].Y = (kbts_u32)ScanlineY;
+                    Result.Intersections[Result.IntersectionCount].X = kbts__LinearInterpolate(Segment.Start.X, Segment.End.X, HeightFraction);
+
+                    ++Result.IntersectionCount;
+                }
+            }
+        }
+
+        KBTS_ASSERT(Result.IntersectionCount % 2 == 0);
+
+        //
+        // Sort the X Intersection buffer such that we can fill lines.
+        // 
+        // BUG:
+        // Now this is just wrong. Uh. We have to start at the starting index for that line.
+        //        
+        
+        for (kbts_u32 I = IntersectionBeforeThisLine; I < Result.IntersectionCount; ++I)
+        {
+            for (kbts_u32 J = IntersectionBeforeThisLine; J < Result.IntersectionCount - 1; ++J)
+            {
+                if (Result.Intersections[J].X > Result.Intersections[J + 1].X)
+                {
+                    kbts__glyph_point Temp = Result.Intersections[J];
+                    Result.Intersections[J] = Result.Intersections[J + 1];
+                    Result.Intersections[J + 1] = Temp;
+                }
+            }
+        }
+
+        ScanlineY += 1;
+    }
+
+    return Result;
+}
+
+
+typedef struct
+{
+    kbts_u8 R;
+    kbts_u8 G;
+    kbts_u8 B;
+    kbts_u8 A;
+} kbts__pixel;
+
+
+static void
+kbts__WriteBMP(const char *Filename, kbts__pixel *Buffer, int Width, int Height)
+{
+    int PixelDataSize = Width * Height * 4;
+    int FileSize = 54 + PixelDataSize;
+
+    kbts_u8 Header[54] = { 0 };
+
+    // File header
+    Header[0] = 'B'; Header[1] = 'M';
+    *(kbts_s32 *)(Header + 2) = FileSize;
+    *(kbts_s32 *)(Header + 10) = 54; // Pixel data offset
+
+    // DIB header
+    *(kbts_s32 *)(Header + 14) = 40;     // DIB header size
+    *(kbts_s32 *)(Header + 18) = Width;
+    *(kbts_s32 *)(Header + 22) = -Height; // Negative = top-down
+    *(kbts_s16 *)(Header + 26) = 1;      // Color planes
+    *(kbts_s16 *)(Header + 28) = 32;     // Bits per pixel
+    *(kbts_s32 *)(Header + 34) = PixelDataSize;
+
+    FILE *File = fopen(Filename, "wb");
+    assert(File);
+    fwrite(Header, 1, 54, File);
+    fwrite(Buffer, 1, PixelDataSize, File);
+    fclose(File);
+}
+
+#include <math.h>
+
+static void kbts__DumpResultToFile(const char *FileName, kbts__glyph_bounding_box BoundingBox, kbts__intersection_buffer Buffer)
+{
+    KBTS_ASSERT(FileName);
+    KBTS_ASSERT(Buffer.Intersections);
+
+    kbts_u32 SizeX = (kbts_u32)(BoundingBox.MaxX - BoundingBox.MinX);
+    kbts_u32 SizeY = (kbts_u32)(BoundingBox.MaxY - BoundingBox.MinY);
+
+    kbts__pixel *OutputBuffer = KBTS_MALLOC(0, SizeX * SizeY * sizeof(kbts__pixel));
+    KBTS_ASSERT(OutputBuffer);
+    KBTS_MEMSET(OutputBuffer, 0, SizeX * SizeY * sizeof(kbts__pixel));
+
+    for (kbts_u32 IntersectIdx = 0; IntersectIdx < Buffer.IntersectionCount; IntersectIdx += 2)
+    {
+        kbts_u32 YPos   = (kbts_u32)(Buffer.Intersections[IntersectIdx].Y);
+        kbts_u32 XStart = (kbts_u32)(ceilf(Buffer.Intersections[IntersectIdx].X));
+        kbts_u32 XEnd   = (kbts_u32)(ceilf(Buffer.Intersections[IntersectIdx + 1].X));
+    
+        for (kbts_u32 X = XStart; X < XEnd; ++X)
+        {
+            kbts__pixel *Pixel = &OutputBuffer[YPos * SizeX + X];
+            Pixel->R = 255;
+            Pixel->G = 255;
+            Pixel->B = 255;
+            Pixel->A = 255;
+        }
+    }
+
+    kbts__WriteBMP(FileName, OutputBuffer, SizeX, SizeY);
+}
+
+
+KBTS_EXPORT void kbts_RasterizeGlyph(kbts_shape_context *Context, kbts_glyph *Glyph)
+{
+    //
+    // I think the scratch arena is only used when dealing with lifetimes.
+    // We should porbably have a rasterize arena or something.
+    //
+
+    kbts__glyph_contour_list *List = kbts__ExtractContoursFromGlyph(Glyph, Context->RunFont, &Context->ScratchArena);
+    kbts__glyph_segment_buffer SegmentBuffer = kbts__ConstructSegmentsFromContourList(List, 10, &Context->ScratchArena);
+    kbts__intersection_buffer IntersectionBuffer = kbts__GenerateIntersectionPointsFromSegments(SegmentBuffer, List->BoundingBox, &Context->ScratchArena);
+
+    kbts__DumpResultToFile("PLEASE_WORK.bmp", List->BoundingBox, IntersectionBuffer);
+
+    if (SegmentBuffer.Segments)
+    {
+        KBTS_ASSERT(SegmentBuffer.Segments);
+    }
 }
 
 #endif
