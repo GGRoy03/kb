@@ -31720,10 +31720,21 @@ kbts__WriteBMP(const char *Filename, kbts__pixel *Buffer, int Width, int Height)
 
 #include <math.h>
 
-static void kbts__DumpResultToFile(const char *FileName, kbts__glyph_bounding_box BoundingBox, kbts__intersection_buffer Buffer)
+
+typedef struct
+{
+    kbts_u32     SizeX;
+    kbts_u32     SizeY;
+    kbts__pixel *Pixels;
+} kbts_rasterized_glyph;
+
+
+static kbts_rasterized_glyph kbts__DumpResultToFile(const char *FileName, kbts__glyph_bounding_box BoundingBox, kbts__intersection_buffer Buffer)
 {
     KBTS_ASSERT(FileName);
     KBTS_ASSERT(Buffer.Intersections);
+
+    kbts_rasterized_glyph Result = {};
 
     kbts_u32 SizeX = (kbts_u32)(BoundingBox.MaxX - BoundingBox.MinX);
     kbts_u32 SizeY = (kbts_u32)(BoundingBox.MaxY - BoundingBox.MinY);
@@ -31748,11 +31759,17 @@ static void kbts__DumpResultToFile(const char *FileName, kbts__glyph_bounding_bo
         }
     }
 
-    kbts__WriteBMP(FileName, OutputBuffer, SizeX, SizeY);
+    // kbts__WriteBMP(FileName, OutputBuffer, SizeX, SizeY);
+
+    Result.Pixels = OutputBuffer;
+    Result.SizeX  = SizeX;
+    Result.SizeY  = SizeY;
+
+    return Result;
 }
 
 
-KBTS_EXPORT void kbts_RasterizeGlyph(kbts_shape_context *Context, kbts_glyph *Glyph)
+KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph(kbts_shape_context *Context, kbts_glyph *Glyph)
 {
     //
     // I think the scratch arena is only used when dealing with lifetimes.
@@ -31763,12 +31780,9 @@ KBTS_EXPORT void kbts_RasterizeGlyph(kbts_shape_context *Context, kbts_glyph *Gl
     kbts__glyph_segment_buffer SegmentBuffer = kbts__ConstructSegmentsFromContourList(List, 10, &Context->ScratchArena);
     kbts__intersection_buffer IntersectionBuffer = kbts__GenerateIntersectionPointsFromSegments(SegmentBuffer, List->BoundingBox, &Context->ScratchArena);
 
-    kbts__DumpResultToFile("PLEASE_WORK.bmp", List->BoundingBox, IntersectionBuffer);
+    kbts_rasterized_glyph Result = kbts__DumpResultToFile("PLEASE_WORK.bmp", List->BoundingBox, IntersectionBuffer);
 
-    if (SegmentBuffer.Segments)
-    {
-        KBTS_ASSERT(SegmentBuffer.Segments);
-    }
+    return Result;
 }
 
 #endif
