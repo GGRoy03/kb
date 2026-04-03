@@ -3880,7 +3880,34 @@ typedef struct
 } kbts_rasterized_glyph;
 
 
-KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph  (kbts_shape_context *Context, kbts_u16 GlyphId);
+typedef struct
+{
+    kbts_s16 X;
+    kbts_s16 Y;
+    kbts_s16 Z;
+    kbts_s16 W;
+} kbts_curve_texel;
+
+
+typedef struct
+{
+    kbts_s16 MinX;
+    kbts_s16 MinY;
+    kbts_s16 MaxX;
+    kbts_s16 MaxY;
+} kbts_glyph_bounding_box;
+
+
+typedef struct
+{
+    kbts_curve_texel       *Texels;
+    kbts_u16                TexelCount;
+    kbts_glyph_bounding_box Bounds;
+} kbts_curve_texture;
+
+
+KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph    (kbts_shape_context *Context, kbts_u16 GlyphId);
+KBTS_EXPORT kbts_curve_texture    kbts_LoadCurveTexture  (kbts_shape_context *Context);
 
 //
 // Other stuff
@@ -3899,7 +3926,7 @@ KBTS_EXPORT kbts_script kbts_ScriptTagToScript(kbts_script_tag Tag);
 
 #endif
 
-#define KB_TEXT_SHAPE_IMPLEMENTATION
+// #define KB_TEXT_SHAPE_IMPLEMENTATION
 
 #ifdef KB_TEXT_SHAPE_IMPLEMENTATION
 #ifdef _MSC_VER
@@ -31034,7 +31061,7 @@ static kbts__wide_string kbts__Win32ConvertToWideString(const char *UTF8, kbts_a
     int SizeNeeded = MultiByteToWideChar(CP_UTF8, 0, UTF8, -1, 0, 0);
     if (SizeNeeded == 0)
     {
-        return;
+        return (kbts__wide_string){0};
     }
 
     kbts__wide_string String =
@@ -31047,14 +31074,14 @@ static kbts__wide_string kbts__Win32ConvertToWideString(const char *UTF8, kbts_a
 
     if (!String.Data)
     {
-        return;
+        return (kbts__wide_string){0};
     }
 
 
     int ConvertedSize = MultiByteToWideChar(CP_UTF8, 0, UTF8, -1, String.Data, SizeNeeded);
     if (ConvertedSize == 0)
     {
-        return;
+        return (kbts__wide_string){0};
     }
 
     return String;
@@ -31222,13 +31249,7 @@ typedef struct
     kbts_b32 OnCurve;
 } kbts__glyph_point;
 
-typedef struct
-{
-    kbts_s16 MinX;
-    kbts_s16 MinY;
-    kbts_s16 MaxX;
-    kbts_s16 MaxY;
-} kbts__glyph_bounding_box;
+
 
 
 typedef struct
@@ -31243,7 +31264,7 @@ typedef struct
 {
     kbts__glyph_contour *Contours;
     kbts_u32 ContourCount;
-    kbts__glyph_bounding_box Bounds;
+    kbts_glyph_bounding_box Bounds;
     kbts_u32 TotalPointCount;
 } kbts__glyph;
 
@@ -31422,8 +31443,8 @@ static kbts__glyph kbts__LoadGlyph(kbts_u16 GlyphId, kbts_font *Font, kbts_arena
                         KBTS_ASSERT(Contour->PointCount < ContourPointCount);
 
                         kbts__glyph_point *Point = Contour->Points + (Contour->PointCount++);
-                        Point->X = CurrentX * (16.0f / Head->UnitsPerEm);
-                        Point->Y = CurrentY * (16.0f / Head->UnitsPerEm);
+                        Point->X = CurrentX;
+                        Point->Y = CurrentY;
                         Point->OnCurve = IsPointOnCurve;
 
                         XByteOffset += XByteCount;
@@ -31442,17 +31463,12 @@ static kbts__glyph kbts__LoadGlyph(kbts_u16 GlyphId, kbts_font *Font, kbts_arena
             // and in which coordinate space?
             //
 
-            float FloatMinX = floorf(*MinX * (16.0f / Head->UnitsPerEm));
-            float FloatMinY = floorf(*MinY * (16.0f / Head->UnitsPerEm));
-            float FloatMaxX = ceilf (*MaxX * (16.0f / Head->UnitsPerEm));
-            float FloatMaxY = ceilf (*MaxY * (16.0f / Head->UnitsPerEm));
-
             Result.ContourCount = ContourCount;
             Result.Contours = Contours;
-            Result.Bounds.MinX = (kbts_s16)FloatMinX;
-            Result.Bounds.MinY = (kbts_s16)FloatMinY;
-            Result.Bounds.MaxX = (kbts_s16)FloatMaxX;
-            Result.Bounds.MaxY = (kbts_s16)FloatMaxY;
+            Result.Bounds.MinX = *MinX;
+            Result.Bounds.MinY = *MinY;
+            Result.Bounds.MaxX = *MaxX;
+            Result.Bounds.MaxY = *MaxY;
             Result.TotalPointCount = LogicalPointCount;
         }
     }
@@ -31646,7 +31662,7 @@ static kbts_u32 kbts__GetSegmentFromPoints(kbts__point *Points, kbts_u32 PointCo
 }
 
 
-static kbts_u32 kbts__GetSortedIntersectionsFromSegments(kbts__segment *Segments, kbts_u32 SegmentCount, kbts__intersection *Intersections, kbts_u32 IntersectionCount, kbts__glyph_bounding_box Bounds)
+static kbts_u32 kbts__GetSortedIntersectionsFromSegments(kbts__segment *Segments, kbts_u32 SegmentCount, kbts__intersection *Intersections, kbts_u32 IntersectionCount, kbts_glyph_bounding_box Bounds)
 {
     kbts_u32 GeneratedIndex = 0;
 
@@ -31798,7 +31814,7 @@ static kbts_rasterized_glyph kbts__DumpResultToFile(const char *FileName, kbts__
 }
 
 
-static kbts_rasterized_glyph kbts__DumpResultToFileEx(const char *FileName, kbts__glyph_bounding_box Bounds, kbts__point *Points, kbts__glyph Glyph)
+static kbts_rasterized_glyph kbts__DumpResultToFileEx(const char *FileName, kbts_glyph_bounding_box Bounds, kbts__point *Points, kbts__glyph Glyph)
 {
     kbts_rasterized_glyph Result = {};
     kbts_u32 SizeX = (kbts_u32)(Bounds.MaxX - Bounds.MinX);
@@ -31917,32 +31933,16 @@ KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph(kbts_shape_context *Contex
 //
 // Notes:
 // - Does that mean we have to upload a texture per glyph? Can we pack multiple glyphs per texture?
+//   I think we can pack them somehow.
 //
 
 
-typedef struct
-{
-    kbts_s16 X;
-    kbts_s16 Y;
-    kbts_s16 Z;
-    kbts_s16 W;
-} curve_texel;
-
-
-typedef struct
-{
-    curve_texel *Bitmap;
-    kbts_u16     Width;
-    kbts_u16     Height;
-} curve_texture;
-
-
-curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
+kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
 {
     kbts_arena Arena = Context->ScratchArena;
     kbts_font *Font  = Context->RunFont;
 
-    kbts__glyph Glyph = kbts__LoadGlyph(0, Font, &Arena);
+    kbts__glyph Glyph = kbts__LoadGlyph(4, Font, &Arena);
 
     kbts__point Points[1024] = {0};
     kbts_u32 GeneratedIndex = 0;
@@ -31994,123 +31994,46 @@ curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
 
     // x, y, z, w -> 16 bits | 64 bits
     // x, y, z, w -> First and second control point belonging to each bezier curve
-    // x, y       -> Third control point of the bezier curve, utilise par la prochaine courbe potentiellement.
+    // x, y       -> Third control point of the bezier curve, used by the next curve (?)
 
-    KBTS_ASSERT(GeneratedIndex % 3 == 0);
-
-    float    TexelUsed    = GeneratedIndex * 1.5f;
+    float    TexelUsed    = (GeneratedIndex / 3.0f) * 1.5f + 1.0f;
     kbts_u16 TextureWidth = (kbts_u16)TexelUsed;
 
-    curve_texture Texture =
+    kbts_curve_texture Texture =
     {
-        .Bitmap = (curve_texel *)KBTS_MALLOC(0, sizeof(curve_texel) * TextureWidth),
-        .Width  = TextureWidth,
-        .Height = 1,
+        .Texels     = (kbts_curve_texel *)KBTS_MALLOC(0, sizeof(kbts_curve_texel) * TextureWidth),
+        .TexelCount = TextureWidth,
+        .Bounds     = Glyph.Bounds,
     };
+    KBTS_MEMSET(Texture.Texels, 0, sizeof(kbts_curve_texel) * TextureWidth);
 
+    kbts_u32          TexelIdx     = 0;
+    kbts_curve_texel *CurrentTexel = 0;
 
-    kbts_u32 TexelIdx = 0;
-    for(kbts_u32 PointIdx = 0; PointIdx < GeneratedIndex; PointIdx += 3)
+    for(kbts_u32 PointIdx = 0; PointIdx < GeneratedIndex; PointIdx++)
     {
         KBTS_ASSERT(TexelIdx < TextureWidth);
         KBTS_ASSERT(TexelIdx + 2 < GeneratedIndex);
 
-        kbts__point Point0 = Points[PointIdx];
-        kbts__point Point1 = Points[PointIdx + 1];
-        kbts__point Point2 = Points[PointIdx + 2];
+        kbts__point Point = Points[PointIdx];
 
-        curve_texel *Texel0 = Texture.Bitmap + TexelIdx;
-        Texel0->X = Point0.X;
-        Texel0->Y = Point0.Y;
-        Texel0->Z = Point1.X;
-        Texel0->W = Point1.Y;
+        if (!CurrentTexel)
+        {
+            CurrentTexel = &Texture.Texels[TexelIdx++];
+            CurrentTexel->X = Point.X;
+            CurrentTexel->Y = Point.Y;
+        }
+        else
+        {
+            CurrentTexel->Z = Point.X;
+            CurrentTexel->W = Point.Y;
 
-        curve_texel *Texel1 = Texture.Bitmap + (TexelIdx + 1);
-        Texel1->X = Point2.X;
-        Texel1->Y = Point2.Y;
+            CurrentTexel = 0;
+        }
     }
-
 
     return Texture;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 #endif
