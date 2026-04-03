@@ -3899,7 +3899,7 @@ KBTS_EXPORT kbts_script kbts_ScriptTagToScript(kbts_script_tag Tag);
 
 #endif
 
-// #define KB_TEXT_SHAPE_IMPLEMENTATION
+#define KB_TEXT_SHAPE_IMPLEMENTATION
 
 #ifdef KB_TEXT_SHAPE_IMPLEMENTATION
 #ifdef _MSC_VER
@@ -31901,6 +31901,217 @@ KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph(kbts_shape_context *Contex
     // kbts_rasterized_glyph Result = kbts__DumpResultToFileEx("HELLO.bmp", Glyph.Bounds, Points, Glyph);
     return Result;
 }
+
+
+//
+// Trying Slug Algorithm Implmentation For Our Rasterizer
+//
+
+
+//
+// Steps:
+//
+// 1) Basic Setup
+// - Loading N texture containing every glyph's control points mapped inside a texture.
+// - Displaying these glyphs by connecting the points (hollow glyphs)
+//
+// Notes:
+// - Does that mean we have to upload a texture per glyph? Can we pack multiple glyphs per texture?
+//
+
+
+typedef struct
+{
+    kbts_s16 X;
+    kbts_s16 Y;
+    kbts_s16 Z;
+    kbts_s16 W;
+} curve_texel;
+
+
+typedef struct
+{
+    curve_texel *Bitmap;
+    kbts_u16     Width;
+    kbts_u16     Height;
+} curve_texture;
+
+
+curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
+{
+    kbts_arena Arena = Context->ScratchArena;
+    kbts_font *Font  = Context->RunFont;
+
+    kbts__glyph Glyph = kbts__LoadGlyph(0, Font, &Arena);
+
+    kbts__point Points[1024] = {0};
+    kbts_u32 GeneratedIndex = 0;
+
+    KBTS__FOR(ContourIdx, 0, Glyph.ContourCount)
+    {
+        kbts__glyph_contour *Contour             = &Glyph.Contours[ContourIdx];
+        kbts_u32             GeneratedStartIndex = GeneratedIndex;
+
+        KBTS_ASSERT(Contour->Points[0].OnCurve);
+
+        KBTS__FOR(PointIdx, 0, Contour->PointCount)
+        {
+            kbts__glyph_point Current = Contour->Points[PointIdx];
+
+            if(Current.OnCurve)
+            {
+                KBTS_ASSERT(GeneratedIndex < 1024);
+
+                Points[GeneratedIndex++] = GlyphPointToPoint(Current);
+                continue;
+            }
+            else
+            {
+                kbts__point P0 = Points[GeneratedIndex - 1];
+                kbts__point P1 = GlyphPointToPoint(Current);
+                kbts__point P2 = GlyphPointToPoint(Contour->Points[(PointIdx + 1) % Contour->PointCount]);
+
+                //
+                // If the next points is also off, we have a cubic bezier.
+                // We want to simplify by making two quadratic bezier out of the cubic one.
+                //
+
+                if(!Contour->Points[(PointIdx + 1) % Contour->PointCount].OnCurve)
+                {
+                    P2.X = P1.X + ((P2.X - P1.X) / 2.0f);
+                    P2.Y = P1.Y + ((P2.Y - P1.Y) / 2.0f);
+                }
+            }
+        }
+
+        //
+        // Wrong?
+        //
+
+        KBTS_ASSERT(GeneratedIndex < 1024);
+        Points[GeneratedIndex++] = Points[GeneratedStartIndex];
+    }
+
+    // x, y, z, w -> 16 bits | 64 bits
+    // x, y, z, w -> First and second control point belonging to each bezier curve
+    // x, y       -> Third control point of the bezier curve, utilise par la prochaine courbe potentiellement.
+
+    KBTS_ASSERT(GeneratedIndex % 3 == 0);
+
+    float    TexelUsed    = GeneratedIndex * 1.5f;
+    kbts_u16 TextureWidth = (kbts_u16)TexelUsed;
+
+    curve_texture Texture =
+    {
+        .Bitmap = (curve_texel *)KBTS_MALLOC(0, sizeof(curve_texel) * TextureWidth),
+        .Width  = TextureWidth,
+        .Height = 1,
+    };
+
+
+    kbts_u32 TexelIdx = 0;
+    for(kbts_u32 PointIdx = 0; PointIdx < GeneratedIndex; PointIdx += 3)
+    {
+        KBTS_ASSERT(TexelIdx < TextureWidth);
+        KBTS_ASSERT(TexelIdx + 2 < GeneratedIndex);
+
+        kbts__point Point0 = Points[PointIdx];
+        kbts__point Point1 = Points[PointIdx + 1];
+        kbts__point Point2 = Points[PointIdx + 2];
+
+        curve_texel *Texel0 = Texture.Bitmap + TexelIdx;
+        Texel0->X = Point0.X;
+        Texel0->Y = Point0.Y;
+        Texel0->Z = Point1.X;
+        Texel0->W = Point1.Y;
+
+        curve_texel *Texel1 = Texture.Bitmap + (TexelIdx + 1);
+        Texel1->X = Point2.X;
+        Texel1->Y = Point2.Y;
+    }
+
+
+    return Texture;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #endif
 
