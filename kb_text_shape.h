@@ -3900,8 +3900,17 @@ typedef struct
 
 typedef struct
 {
+    kbts_u16 StartCurve;
+    kbts_u16 CurveCount;
+} kbts_contour_range;
+
+
+typedef struct
+{
     kbts_curve_texel       *Texels;
     kbts_u16                TexelCount;
+    kbts_contour_range      Contours[8];
+    kbts_u16                ContourCount;
     kbts_glyph_bounding_box Bounds;
 } kbts_curve_texture;
 
@@ -31242,14 +31251,18 @@ static kbts_raster_parameters *kbts__GetRasterParamsFromGlyphIndex(kbts_u32 Glyp
 //
 
 
+typedef enum
+{
+    KBTS_POINT_ON_CURVE    = (1 << 0),
+    KBTS_POINT_END_CONTOUR = (1 << 1),
+} kbts__point_flags;
+
 typedef struct
 {
     kbts_f32 X;
     kbts_f32 Y;
-    kbts_b32 OnCurve;
+    kbts_u32 Flags;
 } kbts__glyph_point;
-
-
 
 
 typedef struct
@@ -31445,7 +31458,7 @@ static kbts__glyph kbts__LoadGlyph(kbts_u16 GlyphId, kbts_font *Font, kbts_arena
                         kbts__glyph_point *Point = Contour->Points + (Contour->PointCount++);
                         Point->X = CurrentX;
                         Point->Y = CurrentY;
-                        Point->OnCurve = IsPointOnCurve;
+                        Point->Flags = IsPointOnCurve ? KBTS_POINT_ON_CURVE : 0;
 
                         XByteOffset += XByteCount;
                         YByteOffset += YByteCount;
@@ -31561,13 +31574,13 @@ static kbts_u32 kbts__GenerateGlyphPoints(kbts__glyph Glyph, kbts__point *Points
         kbts__glyph_contour *Contour             = &Glyph.Contours[ContourIdx];
         kbts_u32             GeneratedStartIndex = GeneratedIndex;
 
-        KBTS_ASSERT(Contour->Points[0].OnCurve);
+        KBTS_ASSERT(Contour->Points[0].Flags & KBTS_POINT_ON_CURVE);
 
         KBTS__FOR(PointIdx, 0, Contour->PointCount)
         {
             kbts__glyph_point Current = Contour->Points[PointIdx];
 
-            if(Current.OnCurve)
+            if(Current.Flags & KBTS_POINT_ON_CURVE)
             {
                 KBTS_ASSERT(GeneratedIndex < PointCount);
 
@@ -31585,7 +31598,7 @@ static kbts_u32 kbts__GenerateGlyphPoints(kbts__glyph Glyph, kbts__point *Points
                 // We want to simplify by making two quadratic bezier out of the cubic one.
                 //
 
-                if(!Contour->Points[(PointIdx + 1) % Contour->PointCount].OnCurve)
+                if(!Contour->Points[(PointIdx + 1) % Contour->PointCount].Flags & KBTS_POINT_ON_CURVE)
                 {
                     P2.X = P1.X + ((P2.X - P1.X) / 2.0f);
                     P2.Y = P1.Y + ((P2.Y - P1.Y) / 2.0f);
@@ -31939,57 +31952,88 @@ KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph(kbts_shape_context *Contex
 
 kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
 {
+    kbts_curve_texture Texture = {0};
+
     kbts_arena Arena = Context->ScratchArena;
     kbts_font *Font  = Context->RunFont;
 
-    kbts__glyph Glyph = kbts__LoadGlyph(4, Font, &Arena);
+    kbts__glyph Glyph = kbts__LoadGlyph(28, Font, &Arena);
 
-    kbts__point Points[1024] = {0};
+    kbts__glyph_point Points[1024] = {0};
     kbts_u32 GeneratedIndex = 0;
 
     KBTS__FOR(ContourIdx, 0, Glyph.ContourCount)
     {
-        kbts__glyph_contour *Contour             = &Glyph.Contours[ContourIdx];
-        kbts_u32             GeneratedStartIndex = GeneratedIndex;
+        kbts__glyph_contour *Contour = Glyph.Contours + ContourIdx;
 
-        KBTS_ASSERT(Contour->Points[0].OnCurve);
 
-        KBTS__FOR(PointIdx, 0, Contour->PointCount)
+
+        KBTS_ASSERT(Contour->Points[0].Flags & KBTS_POINT_ON_CURVE);
+        Points[GeneratedIndex++] = Contour->Points[0];
+
+        kbts_u32 ContourPointIdx = 1;
+        while (ContourPointIdx <= Contour->PointCount)
         {
-            kbts__glyph_point Current = Contour->Points[PointIdx];
+            kbts__glyph_point Current = Points[GeneratedIndex - 1];
+            kbts__glyph_point Next    = Contour->Points[ContourPointIdx % Contour->PointCount];
 
-            if(Current.OnCurve)
+            KBTS_ASSERT(Current.Flags & KBTS_POINT_ON_CURVE);
+
+            if (Next.Flags & KBTS_POINT_ON_CURVE)
             {
-                KBTS_ASSERT(GeneratedIndex < 1024);
+                //
+                // On On
+                //
 
-                Points[GeneratedIndex++] = GlyphPointToPoint(Current);
-                continue;
+                kbts__glyph_point MidPoint =
+                {
+                    .X     = Current.X + ((Next.X - Current.X) / 2.0f),
+                    .Y     = Current.Y + ((Next.Y - Current.Y) / 2.0f),
+                    .Flags = 0,
+                };
+
+                Points[GeneratedIndex++] = MidPoint;
+                Points[GeneratedIndex++] = Next;
+
+                ContourPointIdx   += 1;
             }
             else
             {
-                kbts__point P0 = Points[GeneratedIndex - 1];
-                kbts__point P1 = GlyphPointToPoint(Current);
-                kbts__point P2 = GlyphPointToPoint(Contour->Points[(PointIdx + 1) % Contour->PointCount]);
+                kbts__glyph_point Last = Contour->Points[(ContourPointIdx + 1) % Contour->PointCount];
 
                 //
-                // If the next points is also off, we have a cubic bezier.
-                // We want to simplify by making two quadratic bezier out of the cubic one.
+                // On Off On
                 //
 
-                if(!Contour->Points[(PointIdx + 1) % Contour->PointCount].OnCurve)
+                if (Last.Flags & KBTS_POINT_ON_CURVE)
                 {
-                    P2.X = P1.X + ((P2.X - P1.X) / 2.0f);
-                    P2.Y = P1.Y + ((P2.Y - P1.Y) / 2.0f);
+                    Points[GeneratedIndex++] = Next;
+                    Points[GeneratedIndex++] = Last;
+
+                    ContourPointIdx += 2;
+                }
+                else
+                {
+                    //
+                    // On Off Off
+                    //
+
+                    kbts__glyph_point MidPoint =
+                    {
+                        .X = Next.X + ((Last.X - Next.X) / 2.0f),
+                        .Y = Next.Y + ((Last.Y - Next.Y) / 2.0f),
+                        .Flags = KBTS_POINT_ON_CURVE,
+                    };
+
+                    Points[GeneratedIndex++] = Next;
+                    Points[GeneratedIndex++] = MidPoint;
+
+                    ContourPointIdx += 1;
                 }
             }
         }
 
-        //
-        // Wrong?
-        //
-
-        KBTS_ASSERT(GeneratedIndex < 1024);
-        Points[GeneratedIndex++] = Points[GeneratedStartIndex];
+        Points[GeneratedIndex - 1].Flags |= KBTS_POINT_END_CONTOUR;
     }
 
     // x, y, z, w -> 16 bits | 64 bits
@@ -31999,25 +32043,34 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
     float    TexelUsed    = (GeneratedIndex / 3.0f) * 1.5f + 1.0f;
     kbts_u16 TextureWidth = (kbts_u16)TexelUsed;
 
-    kbts_curve_texture Texture =
-    {
-        .Texels     = (kbts_curve_texel *)KBTS_MALLOC(0, sizeof(kbts_curve_texel) * TextureWidth),
-        .TexelCount = TextureWidth,
-        .Bounds     = Glyph.Bounds,
-    };
+    Texture.Texels     = (kbts_curve_texel *)KBTS_MALLOC(0, sizeof(kbts_curve_texel) * TextureWidth),
+    Texture.TexelCount = TextureWidth,
+    Texture.Bounds     = Glyph.Bounds,
     KBTS_MEMSET(Texture.Texels, 0, sizeof(kbts_curve_texel) * TextureWidth);
 
-    kbts_u32          TexelIdx     = 0;
+    kbts_contour_range *Contour = &Texture.Contours[0];
+    Contour->StartCurve = 0;
+
+    kbts_u32 TexelIdx = 0;
     kbts_curve_texel *CurrentTexel = 0;
 
-    for(kbts_u32 PointIdx = 0; PointIdx < GeneratedIndex; PointIdx++)
+    for (kbts_u32 PointIdx = 0; PointIdx < GeneratedIndex; PointIdx++)
     {
         KBTS_ASSERT(TexelIdx < TextureWidth);
-        KBTS_ASSERT(TexelIdx + 2 < GeneratedIndex);
 
-        kbts__point Point = Points[PointIdx];
+        kbts__glyph_point Point = Points[PointIdx];
 
-        if (!CurrentTexel)
+        if (Point.Flags & KBTS_POINT_END_CONTOUR)
+        {
+            Contour->CurveCount = TexelIdx - Contour->StartCurve;
+
+            KBTS_ASSERT(Texture.ContourCount + 1 < 8);
+
+            Contour = &Texture.Contours[++Texture.ContourCount];
+            Contour->StartCurve = TexelIdx + 1;
+        }
+
+        if (Point.Flags & KBTS_POINT_ON_CURVE)
         {
             CurrentTexel = &Texture.Texels[TexelIdx++];
             CurrentTexel->X = Point.X;
@@ -32027,8 +32080,6 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
         {
             CurrentTexel->Z = Point.X;
             CurrentTexel->W = Point.Y;
-
-            CurrentTexel = 0;
         }
     }
 
