@@ -19,23 +19,25 @@
 // Globals
 // -------------------------------------------------------
 
-static HWND                     Window           = 0;
-static ID3D11Device            *Device           = 0;
-static ID3D11DeviceContext     *Context          = 0;
-static IDXGISwapChain          *SwapChain        = 0;
-static ID3D11RenderTargetView  *BackbufferRTV    = 0;
-static ID3D11VertexShader      *TextVS           = 0;
-static ID3D11PixelShader       *TextPS           = 0;
-static ID3D11InputLayout       *TextInputLayout  = 0;
-static ID3D11Buffer            *TextVertexBuffer = 0;
-static ID3D11Buffer            *PerPassCB        = 0;
-static ID3D11Buffer            *PerGlyphCB       = 0;
-static ID3D11RasterizerState   *RasterState      = 0;
-static ID3D11Texture2D         *CurveTexture2D   = 0;
-static ID3D11ShaderResourceView*CurveSRV         = 0;
-static kbts_shape_context      *ShapeContext     = 0;
-static kbts_curve_texture       CurveTexture     = {0};
-static int                      CurveUploaded    = 0;
+static HWND                      Window            = 0;
+static ID3D11Device             *Device            = 0;
+static ID3D11DeviceContext      *Context           = 0;
+static IDXGISwapChain           *SwapChain         = 0;
+static ID3D11RenderTargetView   *BackbufferRTV     = 0;
+static ID3D11VertexShader       *TextVS            = 0;
+static ID3D11PixelShader        *TextPS            = 0;
+static ID3D11InputLayout        *TextInputLayout   = 0;
+static ID3D11Buffer             *TextVertexBuffer  = 0;
+static ID3D11Buffer             *PerPassCB         = 0;
+static ID3D11Buffer             *PerGlyphCB        = 0;
+static ID3D11RasterizerState    *RasterState       = 0;
+static ID3D11Texture2D          *CurveTexture2D    = 0;
+static ID3D11ShaderResourceView *CurveSRV          = 0;
+static ID3D11Texture2D          *MetadataTexture2D = 0;
+static ID3D11ShaderResourceView *MetadataSRV       = 0;
+static kbts_shape_context       *ShapeContext      = 0;
+static kbts_curve_texture        CurveTexture      = {0};
+static int                       CurveUploaded     = 0;
 
 static int WindowWidth  = 1920;
 static int WindowHeight = 1080;
@@ -48,8 +50,9 @@ static int Running      = 1;
 
 typedef struct
 {
-    float PosX , PosY;
-    float NormX, NormY;
+    float    PosX , PosY;
+    float    NormX, NormY;
+    uint32_t GlyphID;
 } text_vertex;
 
 
@@ -202,10 +205,11 @@ TextRenderInit(void)
     // Input layout
     D3D11_INPUT_ELEMENT_DESC Layout[] =
     {
-        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,  8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "U_GID"   , 0, DXGI_FORMAT_R32_UINT    , 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    Device->lpVtbl->CreateInputLayout(Device, Layout, 2, TextVertexShaderBytes, sizeof(TextVertexShaderBytes), &TextInputLayout);
+    Device->lpVtbl->CreateInputLayout(Device, Layout, 3, TextVertexShaderBytes, sizeof(TextVertexShaderBytes), &TextInputLayout);
 
     // Vertex buffer (6 vertices for a quad)
     D3D11_BUFFER_DESC VBDesc =
@@ -261,6 +265,30 @@ TextRenderInit(void)
     };
     Device->lpVtbl->CreateShaderResourceView(Device, (ID3D11Resource *)CurveTexture2D, &SRVDesc, &CurveSRV);
 
+    // Metadata texture (1024x1024, R16G16_UINT)
+    D3D11_TEXTURE2D_DESC MetadataTexDesc =
+    {
+        .Width          = 1024,
+        .Height         = 1024,
+        .MipLevels      = 1,
+        .ArraySize      = 1,
+        .Format         = DXGI_FORMAT_R16G16_UINT,
+        .SampleDesc     = {.Count = 1, .Quality = 0 },
+        .Usage          = D3D11_USAGE_DYNAMIC,
+        .BindFlags      = D3D11_BIND_SHADER_RESOURCE,
+        .CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+    };
+    Device->lpVtbl->CreateTexture2D(Device, &MetadataTexDesc, 0, &MetadataTexture2D);
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC MetadataSRVDesc =
+    {
+        .Format                    = MetadataTexDesc.Format,
+        .ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D.MipLevels       = 1,
+        .Texture2D.MostDetailedMip = 0,
+    };
+    Device->lpVtbl->CreateShaderResourceView(Device, (ID3D11Resource *)MetadataTexture2D, &MetadataSRVDesc, &MetadataSRV);
+
     // Rasterizer
     D3D11_RASTERIZER_DESC RasterDesc =
     {
@@ -303,16 +331,35 @@ Render(void)
 
     if(!CurveUploaded && CurveTexture.Texels)
     {
-        D3D11_MAPPED_SUBRESOURCE Mapped = {0};
-        Context->lpVtbl->Map(Context, (ID3D11Resource *)CurveTexture2D, 0, D3D11_MAP_WRITE_DISCARD, 0, &Mapped);
-        if(Mapped.pData)
+        // Upload curve geometry texture data
         {
-            // Copy row by row — texture pitch may be larger than our data width
-            uint8_t  *Dst         = (uint8_t *)Mapped.pData;
-            uint8_t  *Src         = (uint8_t *)CurveTexture.Texels;
-            size_t    RowBytes    = CurveTexture.TexelCount * 4 * sizeof(uint16_t);
-            memcpy(Dst, Src, RowBytes);
-            Context->lpVtbl->Unmap(Context, (ID3D11Resource *)CurveTexture2D, 0);
+            D3D11_MAPPED_SUBRESOURCE Mapped = { 0 };
+            Context->lpVtbl->Map(Context, (ID3D11Resource *)CurveTexture2D, 0, D3D11_MAP_WRITE_DISCARD, 0, &Mapped);
+            if (Mapped.pData)
+            {
+                // Copy row by row — texture pitch may be larger than our data width
+                uint8_t *Dst = (uint8_t *)Mapped.pData;
+                uint8_t *Src = (uint8_t *)CurveTexture.Texels;
+                size_t    RowBytes = CurveTexture.TexelCount * 4 * sizeof(uint16_t);
+                memcpy(Dst, Src, RowBytes);
+                Context->lpVtbl->Unmap(Context, (ID3D11Resource *)CurveTexture2D, 0);
+            }
+        }
+
+        // Upload glyph meta-data texture data.
+        {
+            D3D11_MAPPED_SUBRESOURCE Mapped = { 0 };
+            Context->lpVtbl->Map(Context, (ID3D11Resource *)MetadataTexture2D, 0, D3D11_MAP_WRITE_DISCARD, 0, &Mapped);
+            if (Mapped.pData)
+            {
+                uint8_t *Dst      = (uint8_t *)Mapped.pData;
+                uint8_t *Src      = (uint8_t *)CurveTexture.Metadata;
+                size_t   RowBytes = CurveTexture.MetadataCount * 2 * sizeof(uint16_t);
+
+                memcpy(Dst, Src, RowBytes);
+
+                Context->lpVtbl->Unmap(Context, (ID3D11Resource *)MetadataTexture2D, 0);
+            }
         }
 
         CurveUploaded = 1;
@@ -327,23 +374,26 @@ Render(void)
         Context->lpVtbl->Unmap(Context, (ID3D11Resource *)PerPassCB, 0);
     }
 
-    // Update PerGlyph cbuffer
-    {
-        per_glyph_cb PerGlyph =
-        {
-            .ContourCount      = CurveTexture.ContourCount,
-            .Contours[0].Start = CurveTexture.Contours[0].StartCurve,
-            .Contours[0].Count = CurveTexture.Contours[0].CurveCount,
-            .Contours[1].Start = CurveTexture.Contours[1].StartCurve,
-            .Contours[1].Count = CurveTexture.Contours[1].CurveCount,
-        };
+    // Update PerGlyph cbuffer (legacy)
+    //{
+    //    per_glyph_cb PerGlyph =
+    //    {
+    //        .ContourCount = CurveTexture.ContourCount,
+    //    };
+
+    //    assert(CurveTexture.ContourCount <= sizeof(PerGlyph.Contours) / sizeof(PerGlyph.Contours[0]));
+    //    for (uint32_t ContourIdx = 0; ContourIdx < CurveTexture.ContourCount; ++ContourIdx)
+    //    {
+    //        PerGlyph.Contours[ContourIdx].Start = CurveTexture.Contours[ContourIdx].StartCurve;
+    //        PerGlyph.Contours[ContourIdx].Count = CurveTexture.Contours[ContourIdx].CurveCount;
+    //    }
 
 
-        D3D11_MAPPED_SUBRESOURCE Mapped = {0};
-        Context->lpVtbl->Map(Context, (ID3D11Resource *)PerGlyphCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &Mapped);
-        *(per_glyph_cb *)Mapped.pData = PerGlyph;
-        Context->lpVtbl->Unmap(Context, (ID3D11Resource *)PerGlyphCB, 0);
-    }
+    //    D3D11_MAPPED_SUBRESOURCE Mapped = {0};
+    //    Context->lpVtbl->Map(Context, (ID3D11Resource *)PerGlyphCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &Mapped);
+    //    *(per_glyph_cb *)Mapped.pData = PerGlyph;
+    //    Context->lpVtbl->Unmap(Context, (ID3D11Resource *)PerGlyphCB, 0);
+    //}
 
     // Build quad (6 vertices, 2 triangles)
     // Screen pos: (QuadX, QuadY) to (QuadX+QuadW, QuadY+QuadH)
@@ -363,13 +413,13 @@ Render(void)
 
         text_vertex Verts[6] =
         {
-            { L, T,  MinX, MaxY },
-            { R, T,  MaxX, MaxY },
-            { R, B,  MaxX, MinY },
+            { L, T,  MinX, MaxY, 0},
+            { R, T,  MaxX, MaxY, 0},
+            { R, B,  MaxX, MinY, 0},
 
-            { L, T,  MinX, MaxY },
-            { R, B,  MaxX, MinY },
-            { L, B,  MinX, MinY },
+            { L, T,  MinX, MaxY, 0 },
+            { R, B,  MaxX, MinY, 0 },
+            { L, B,  MinX, MinY, 0 },
         };
 
         D3D11_MAPPED_SUBRESOURCE Mapped = {0};
@@ -390,8 +440,8 @@ Render(void)
     Context->lpVtbl->VSSetShader(Context, TextVS, 0, 0);
     Context->lpVtbl->VSSetConstantBuffers(Context, 0, 1, &PerPassCB);
     Context->lpVtbl->PSSetShader(Context, TextPS, 0, 0);
-    Context->lpVtbl->PSSetConstantBuffers(Context, 1, 1, &PerGlyphCB);
     Context->lpVtbl->PSSetShaderResources(Context, 0, 1, &CurveSRV);
+    Context->lpVtbl->PSSetShaderResources(Context, 1, 1, &MetadataSRV);
     Context->lpVtbl->RSSetState(Context, RasterState);
     Context->lpVtbl->Draw(Context, 6, 0);
 
@@ -437,7 +487,7 @@ WinMain(HINSTANCE Instance, HINSTANCE Prev, LPSTR CmdLine, int CmdShow)
     kbts_ShapePushFontFromFile(ShapeContext, "font/TrenchThin.ttf", 0);
 
     kbts_ShapeBegin(ShapeContext, KBTS_DIRECTION_DONT_KNOW, KBTS_LANGUAGE_DONT_KNOW);
-    kbts_ShapeUtf8(ShapeContext, "A", 1, KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
+    kbts_ShapeUtf8(ShapeContext, "ABC", 3, KBTS_USER_ID_GENERATION_MODE_CODEPOINT_INDEX);
     kbts_ShapeEnd(ShapeContext);
 
     kbts_run Run;

@@ -3900,16 +3900,17 @@ typedef struct
 
 typedef struct
 {
-    kbts_u16 StartCurve;
-    kbts_u16 CurveCount;
-} kbts_contour_range;
+    kbts_u16 Start;
+    kbts_u16 Count;
+} kbts_glyph_metadata;
 
 
 typedef struct
 {
     kbts_curve_texel       *Texels;
     kbts_u16                TexelCount;
-    kbts_contour_range      Contours[8];
+    kbts_glyph_metadata    *Metadata;
+    kbts_u16                MetadataCount;
     kbts_u16                ContourCount;
     kbts_glyph_bounding_box Bounds;
 } kbts_curve_texture;
@@ -31257,6 +31258,7 @@ typedef enum
     KBTS_POINT_END_CONTOUR = (1 << 1),
 } kbts__point_flags;
 
+
 typedef struct
 {
     kbts_f32 X;
@@ -31950,6 +31952,35 @@ KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph(kbts_shape_context *Contex
 //
 
 
+static kbts_s16
+kbts__FloatToHalfPrecision(float ValueF32)
+{
+    //
+    // We need the C runtime to do this, maybe just copy byte per byte using a loop.
+    //
+
+    kbts_u32 ValueU32;
+    memcpy(&ValueU32, &ValueF32, sizeof(ValueU32));
+
+    kbts_u32 Sign = (ValueU32 >> 31) & 0x1;
+    kbts_u32 Mantissa = ValueU32 & 0x7FFFFF;
+    kbts_s32 Exponent = (kbts_s32)((ValueU32 >> 23) & 0xFF) - 127 + 15;
+
+    if(Exponent >= 31)
+    {
+        return (kbts_u16)(Sign << 15 | 0x7C00); // Overflow -> infinity
+    }
+    else if(Exponent <= 0)
+    {
+        return (kbts_u16)(Sign << 15); // Underflow -> 0
+    }
+    else
+    {
+        return (kbts_u16)(Sign << 15 | Exponent << 10 | (Mantissa >> 13));
+    }
+}
+
+
 kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
 {
     kbts_curve_texture Texture = {0};
@@ -31966,10 +31997,12 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
     {
         kbts__glyph_contour *Contour = Glyph.Contours + ContourIdx;
 
-
-
         KBTS_ASSERT(Contour->Points[0].Flags & KBTS_POINT_ON_CURVE);
         Points[GeneratedIndex++] = Contour->Points[0];
+
+        //
+        // Special case the end point so we can remove the (potentially) expensive modulo from the hot loop?
+        //
 
         kbts_u32 ContourPointIdx = 1;
         while (ContourPointIdx <= Contour->PointCount)
@@ -32040,17 +32073,18 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
     // x, y, z, w -> First and second control point belonging to each bezier curve
     // x, y       -> Third control point of the bezier curve, used by the next curve (?)
 
-    float    TexelUsed    = (GeneratedIndex / 3.0f) * 1.5f + 1.0f;
+    float    TexelUsed    = (GeneratedIndex / 3.0f) * 1.5f + 1.5f;
     kbts_u16 TextureWidth = (kbts_u16)TexelUsed;
 
-    Texture.Texels     = (kbts_curve_texel *)KBTS_MALLOC(0, sizeof(kbts_curve_texel) * TextureWidth),
-    Texture.TexelCount = TextureWidth,
-    Texture.Bounds     = Glyph.Bounds,
+    Texture.Texels = (kbts_curve_texel *)KBTS_MALLOC(0, sizeof(kbts_curve_texel) * TextureWidth);
+    Texture.Metadata = (kbts_glyph_metadata *)KBTS_MALLOC(0, sizeof(kbts_glyph_metadata) * (Glyph.ContourCount + 1));
+    Texture.MetadataCount = Glyph.ContourCount + 1;
+    Texture.TexelCount = TextureWidth;
+    Texture.Bounds = Glyph.Bounds;
     KBTS_MEMSET(Texture.Texels, 0, sizeof(kbts_curve_texel) * TextureWidth);
+    KBTS_MEMSET(Texture.Metadata, 0, sizeof(kbts_glyph_metadata) * Glyph.ContourCount + 1);
 
-    kbts_contour_range *Contour = &Texture.Contours[0];
-    Contour->StartCurve = 0;
-
+    kbts_glyph_metadata *CurveMetadata = Texture.Metadata + 1;
     kbts_u32 TexelIdx = 0;
     kbts_curve_texel *CurrentTexel = 0;
 
@@ -32062,26 +32096,36 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
 
         if (Point.Flags & KBTS_POINT_END_CONTOUR)
         {
-            Contour->CurveCount = TexelIdx - Contour->StartCurve;
+            CurveMetadata->Count = TexelIdx - CurveMetadata->Start;
 
-            KBTS_ASSERT(Texture.ContourCount + 1 < 8);
+            //
+            // Overlfow?
+            //
 
-            Contour = &Texture.Contours[++Texture.ContourCount];
-            Contour->StartCurve = TexelIdx + 1;
+            CurveMetadata = CurveMetadata + 1;
+            CurveMetadata->Start = TexelIdx + 1;
         }
+
+        //
+        // Convert f32 to f16 here. We can't represent f16 natively, so we just store it as a int16.
+        //
 
         if (Point.Flags & KBTS_POINT_ON_CURVE)
         {
             CurrentTexel = &Texture.Texels[TexelIdx++];
-            CurrentTexel->X = Point.X;
-            CurrentTexel->Y = Point.Y;
+            CurrentTexel->X = kbts__FloatToHalfPrecision(Point.X);
+            CurrentTexel->Y = kbts__FloatToHalfPrecision(Point.Y);
         }
         else
         {
-            CurrentTexel->Z = Point.X;
-            CurrentTexel->W = Point.Y;
+            CurrentTexel->Z = kbts__FloatToHalfPrecision(Point.X);
+            CurrentTexel->W = kbts__FloatToHalfPrecision(Point.Y);
         }
     }
+
+    kbts_glyph_metadata *ContourMetadata = Texture.Metadata;
+    ContourMetadata->Start = 1;                               // Temporary, should point to where the flat list of contours is stored.
+    ContourMetadata->Count = CurveMetadata - ContourMetadata;
 
     return Texture;
 }
