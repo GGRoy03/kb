@@ -108,7 +108,7 @@ uint ComputeRootCode(float y0, float y1, float y2)
     uint Sign0 = (y0 > 0.0f) ? 2U : 0U;
     uint Sign1 = (y1 > 0.0f) ? 4U : 0U;
     uint Sign2 = (y2 > 0.0f) ? 8U : 0U;
-    uint Shift = Sign0 | Sign1 | Sign2;
+    uint Shift = Sign2 | Sign1 | Sign0;
     
     uint Table = 0x2E74U;
     uint Entry = Table >> Shift;
@@ -122,7 +122,7 @@ float4 PS(PS_INPUT Input) : SV_TARGET
 {
     int WindingNumber = 0;
     
-    for (uint TexelIndex = 0; TexelIndex < CurveTexelCount; ++TexelIndex)
+    for (uint TexelIndex = 0; TexelIndex < CurveTexelCount - 1; ++TexelIndex)
     {
         //
         // The CurveTexture contains the control points that form the outlines of the glyphs represented as quadratic Bezier curves.
