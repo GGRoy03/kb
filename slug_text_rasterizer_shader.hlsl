@@ -78,8 +78,14 @@ float2 FindHorizontalHit(float2 P0, float2 P1, float2 P2)
     // If A is close to 0, then the expression is nearly linear.
     // Solve: -2bt + c = 0, -2bt = -c, -2t = -c/b, t = -c/b/-2, t = C/(B/2)
     //
+    // NOTE: I have to use a bigger threshold because of precision issues,
+    // I don't know why the reference paper doesn't do that. Perhaps we should
+    // directly store as float16s in the loader so we create real bezier curve?
+    // This could very well be the issue, because in cases where we have a line and
+    // the line is small enough, we're going to create the wrong off-curve point.
+    //
     
-    if(abs(CoeffA.y) < 1.0f / 65536.0f)
+    if(abs(CoeffA.y) < 1.0f / 24556.0f)
     {
         T0 = CoeffC.y * (0.5f / CoeffB.y);
         T1 = CoeffC.y * (0.5f / CoeffB.y);
@@ -120,7 +126,10 @@ uint ComputeRootCode(float y0, float y1, float y2)
 
 float4 PS(PS_INPUT Input) : SV_TARGET
 {
-    int WindingNumber = 0;
+    float2 EMsPerPixel = fwidth(Input.PixelCoordInEmSpace);
+    float2 PixelsPerEM = 1.0f / EMsPerPixel;
+    
+    float XCoverage = 0.0f;
     
     for (uint TexelIndex = 0; TexelIndex < CurveTexelCount - 1; ++TexelIndex)
     {
@@ -148,26 +157,19 @@ float4 PS(PS_INPUT Input) : SV_TARGET
         uint RootCode = ComputeRootCode(Point0.y, Point1.y, Point2.y);
         if (RootCode != 0U)
         {
-            float2 Roots = FindHorizontalHit(Point0, Point1, Point2);
+            float2 Roots = FindHorizontalHit(Point0, Point1, Point2) * PixelsPerEM;
 
-            if ((RootCode & 1U) != 0U && Roots.x >= 0.0f)
+            if ((RootCode & 1U) != 0U)
             {
-                WindingNumber += 1;
+                XCoverage += saturate(Roots.x + 0.5f);
             }
 
-            if ((RootCode & 2U) != 0U && Roots.y >= 0.0f)
+            if ((RootCode & 2U) != 0U)
             {
-                WindingNumber -= 1;
+                XCoverage -= saturate(Roots.y + 0.5f);
             }
         }
     }
     
-    if (WindingNumber != 0)
-    {
-        return float4(1.0f, 1.0f, 1.0f, 1.0f);
-    }
-    else
-    {
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    }
+    return float4(XCoverage, XCoverage, XCoverage, 1.0f);
 }
