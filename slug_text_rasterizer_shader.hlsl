@@ -1,3 +1,10 @@
+struct GLYPH_CONTOUR
+{
+    uint Count;
+    uint Start;
+};
+
+
 cbuffer PerPass : register(b0)
 {
     float4x4 ViewProj;
@@ -6,7 +13,8 @@ cbuffer PerPass : register(b0)
 
 cbuffer PerGlyph : register(b1)
 {
-    uint CurveTexelCount;
+    uint          ContourCount;
+    GLYPH_CONTOUR Contours[4];
 };
 
 
@@ -76,19 +84,22 @@ float2 FindHorizontalHit(float2 P0, float2 P1, float2 P2)
     
     //
     // If A is close to 0, then the expression is nearly linear.
-    // Solve: -2bt + c = 0, -2bt = -c, -2t = -c/b, t = -c/b/-2, t = C/(B/2)
+    // Solve: -2bt + c = 0, -2bt = -c, -2t = -c/b, t = -c/b/-2, t = C/(B*2)
     //
-    // NOTE: I have to use a bigger threshold because of precision issues,
-    // I don't know why the reference paper doesn't do that. Perhaps we should
-    // directly store as float16s in the loader so we create real bezier curve?
-    // This could very well be the issue, because in cases where we have a line and
-    // the line is small enough, we're going to create the wrong off-curve point.
+    // NOTE:
+    // I am not sure why my code is suffering from float imprecision while the paper says it shouldn't be
+    // and the reference shader is identical (even if this is a simplified version). We use a relative
+    // check instead where we approximate the maximum float precision from our inputs and treat numbers
+    // lower than that as 0s, scale by 8, because of other rounding issues that could've accumulated.
     //
     
-    if(abs(CoeffA.y) < 1.0f / 24556.0f)
+    float Scale   = max(max(abs(P0.y), abs(P1.y)), abs(P2.y));
+    float Epsilon = 8.0f * 1.1920929e-7f * Scale;
+
+    if (abs(CoeffA.y) < Epsilon)
     {
-        T0 = CoeffC.y * (0.5f / CoeffB.y);
-        T1 = CoeffC.y * (0.5f / CoeffB.y);
+        T0 = CoeffC.y / (2.0f * CoeffB.y);
+        T1 = CoeffC.y / (2.0f * CoeffB.y);
     }
     
     //
@@ -131,44 +142,49 @@ float4 PS(PS_INPUT Input) : SV_TARGET
     
     float XCoverage = 0.0f;
     
-    for (uint TexelIndex = 0; TexelIndex < CurveTexelCount - 1; ++TexelIndex)
+    for (uint ContourIdx = 0; ContourIdx < ContourCount; ++ContourIdx)
     {
-        //
-        // The CurveTexture contains the control points that form the outlines of the glyphs represented as quadratic Bezier curves.
-        // Texel0 contains the first and second point (xy | zw)
-        // Texel1 contains the third point (xy)
-        //
+        GLYPH_CONTOUR Contour = Contours[ContourIdx];
         
-        float4 Texel0 = CurveTexture.Load(int3(TexelIndex    , 0, 0));
-        float4 Texel1 = CurveTexture.Load(int3(TexelIndex + 1, 0, 0));
-        
-        //
-        // Move the points as if the pixel we are rendering was at the origin.
-        //
-        
-        float2 Point0 = Texel0.xy - Input.PixelCoordInEmSpace;
-        float2 Point1 = Texel0.zw - Input.PixelCoordInEmSpace;
-        float2 Point2 = Texel1.xy - Input.PixelCoordInEmSpace;
-        
-        //
-        // Compute the root code, the root code tells us what to do with our root values
-        //
-        
-        uint RootCode = ComputeRootCode(Point0.y, Point1.y, Point2.y);
-        if (RootCode != 0U)
+        for (uint TexelIndex = 0; TexelIndex < Contour.Count; ++TexelIndex)
         {
-            float2 Roots = FindHorizontalHit(Point0, Point1, Point2) * PixelsPerEM;
-
-            if ((RootCode & 1U) != 0U)
-            {
-                XCoverage += saturate(Roots.x + 0.5f);
-            }
-
-            if ((RootCode & 2U) != 0U)
-            {
-                XCoverage -= saturate(Roots.y + 0.5f);
-            }
-        }
+             //
+             // The CurveTexture contains the control points that form the outlines of the glyphs represented as quadratic Bezier curves.
+             // Texel0 contains the first and second point (xy | zw)
+             // Texel1 contains the third point (xy)
+             //
+                 
+             float4 Texel0 = CurveTexture.Load(int3(Contour.Start + TexelIndex    , 0, 0));
+             float4 Texel1 = CurveTexture.Load(int3(Contour.Start + TexelIndex + 1, 0, 0));
+                 
+             //
+             // Move the points as if the pixel we are rendering was at the origin.
+             //
+                 
+             float2 Point0 = Texel0.xy - Input.PixelCoordInEmSpace;
+             float2 Point1 = Texel0.zw - Input.PixelCoordInEmSpace;
+             float2 Point2 = Texel1.xy - Input.PixelCoordInEmSpace;
+                 
+             //
+             // Compute the root code, the root code tells us what to do with our root values
+             //
+                 
+             uint RootCode = ComputeRootCode(Point0.y, Point1.y, Point2.y);
+             if (RootCode != 0U)
+             {
+                 float2 Roots = FindHorizontalHit(Point0, Point1, Point2) * PixelsPerEM;
+             
+                 if ((RootCode & 1U) != 0U)
+                 {
+                     XCoverage += saturate(Roots.x + 0.5f);
+                 }
+             
+                 if ((RootCode & 2U) != 0U)
+                 {
+                     XCoverage -= saturate(Roots.y + 0.5f);
+                 }
+             }
+         }
     }
     
     return float4(XCoverage, XCoverage, XCoverage, 1.0f);
