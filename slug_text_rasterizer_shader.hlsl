@@ -1,37 +1,27 @@
-struct GLYPH_CONTOUR
-{
-    uint Count;
-    uint Start;
-};
-
-
 cbuffer PerPass : register(b0)
 {
     float4x4 ViewProj;
 };
 
 
-cbuffer PerGlyph : register(b1)
-{
-    uint          ContourCount;
-    GLYPH_CONTOUR Contours[4];
-};
-
-
 struct VS_INPUT
 {
-    float2 ScreenPosInPixel    : POSITION;
-    float2 PixelCoordInEmSpace : TEXCOORD;
+    float2               ScreenPosInPixel    : POSITION;
+    float2               PixelCoordInEmSpace : TEXCOORD;   
+    nointerpolation uint GlyphID             : U_GID;
 };
+
 
 struct PS_INPUT
 {
-    float4 Position          : SV_Position;
-    float2 PixelCoordInEmSpace : EMTX;
+    float4               Position            : SV_Position;
+    float2               PixelCoordInEmSpace : EMTX;
+    nointerpolation uint GlyphID             : U_GID;
 };
 
 
-Texture2D CurveTexture : register(t0); // Control Point Texture
+Texture2D        CurveTexture : register(t0); // Control Point Texture
+Texture2D<uint2> MetaTexture  : register(t1); // Contour Info Texture
 
 
 PS_INPUT VS(VS_INPUT Input)
@@ -40,6 +30,7 @@ PS_INPUT VS(VS_INPUT Input)
     
     Output.Position            = mul(ViewProj, float4(Input.ScreenPosInPixel, 0, 1));
     Output.PixelCoordInEmSpace = Input.PixelCoordInEmSpace;
+    Output.GlyphID             = Input.GlyphID;
     
     return Output;
 }
@@ -142,11 +133,25 @@ float4 PS(PS_INPUT Input) : SV_TARGET
     
     float XCoverage = 0.0f;
     
+    //
+    // Not the most optimal packing...
+    //
+    
+    uint2 GlyphMeta    = MetaTexture.Load(int3(Input.GlyphID, 0, 0));
+    uint  ContourStart = GlyphMeta.x;
+    uint  ContourCount = GlyphMeta.y;
+    
     for (uint ContourIdx = 0; ContourIdx < ContourCount; ++ContourIdx)
     {
-        GLYPH_CONTOUR Contour = Contours[ContourIdx];
+        //
+        // Not the most optimal packing...
+        //
         
-        for (uint TexelIndex = 0; TexelIndex < Contour.Count; ++TexelIndex)
+        uint2 ContourMeta = MetaTexture.Load(int3(ContourStart + ContourIdx, 0, 0));
+        uint  CurveStart  = ContourMeta.x;
+        uint  CurveCount  = ContourMeta.y;
+            
+        for (uint TexelIndex = 0; TexelIndex < CurveCount; ++TexelIndex)
         {
              //
              // The CurveTexture contains the control points that form the outlines of the glyphs represented as quadratic Bezier curves.
@@ -154,8 +159,8 @@ float4 PS(PS_INPUT Input) : SV_TARGET
              // Texel1 contains the third point (xy)
              //
                  
-             float4 Texel0 = CurveTexture.Load(int3(Contour.Start + TexelIndex    , 0, 0));
-             float4 Texel1 = CurveTexture.Load(int3(Contour.Start + TexelIndex + 1, 0, 0));
+             float4 Texel0 = CurveTexture.Load(int3(CurveStart + TexelIndex    , 0, 0));
+             float4 Texel1 = CurveTexture.Load(int3(CurveStart + TexelIndex + 1, 0, 0));
                  
              //
              // Move the points as if the pixel we are rendering was at the origin.
