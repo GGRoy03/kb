@@ -32126,7 +32126,7 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context, kbts_u16 G
 
     kbts_glyph_metadata *ContourMetadata = Texture.Metadata;
     ContourMetadata->Start = 1;                               // Temporary, should point to where the flat list of contours is stored.
-    ContourMetadata->Count = CurveMetadata - ContourMetadata;
+    ContourMetadata->Count = Glyph.ContourCount;
 
     return Texture;
 }
