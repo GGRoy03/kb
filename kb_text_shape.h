@@ -32081,7 +32081,7 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context, kbts_u16 G
     Texture.MetadataCount = Glyph.ContourCount + 1;
     Texture.Bounds = Glyph.Bounds;
     KBTS_MEMSET(Texture.Texels, 0, sizeof(kbts_curve_texel) * TextureWidth);
-    KBTS_MEMSET(Texture.Metadata, 0, sizeof(kbts_glyph_metadata) * Glyph.ContourCount + 1);
+    KBTS_MEMSET(Texture.Metadata, 0, sizeof(kbts_glyph_metadata) * (Glyph.ContourCount + 1));
 
     kbts_glyph_metadata *CurveMetadata = Texture.Metadata + 1;
     kbts_u32 TexelIdx = 0;
