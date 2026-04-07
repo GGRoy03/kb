@@ -32079,7 +32079,6 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context, kbts_u16 G
     Texture.Texels = (kbts_curve_texel *)KBTS_MALLOC(0, sizeof(kbts_curve_texel) * TextureWidth);
     Texture.Metadata = (kbts_glyph_metadata *)KBTS_MALLOC(0, sizeof(kbts_glyph_metadata) * (Glyph.ContourCount + 1));
     Texture.MetadataCount = Glyph.ContourCount + 1;
-    Texture.TexelCount = TextureWidth;
     Texture.Bounds = Glyph.Bounds;
     KBTS_MEMSET(Texture.Texels, 0, sizeof(kbts_curve_texel) * TextureWidth);
     KBTS_MEMSET(Texture.Metadata, 0, sizeof(kbts_glyph_metadata) * Glyph.ContourCount + 1);
@@ -32122,6 +32121,8 @@ kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context, kbts_u16 G
             CurrentTexel->W = kbts__FloatToHalfPrecision(Point.Y);
         }
     }
+
+    Texture.TexelCount = TexelIdx - 1;
 
     kbts_glyph_metadata *ContourMetadata = Texture.Metadata;
     ContourMetadata->Start = 1;                               // Temporary, should point to where the flat list of contours is stored.
