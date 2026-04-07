@@ -3917,7 +3917,7 @@ typedef struct
 
 
 KBTS_EXPORT kbts_rasterized_glyph kbts_RasterizeGlyph    (kbts_shape_context *Context, kbts_u16 GlyphId);
-KBTS_EXPORT kbts_curve_texture    kbts_LoadCurveTexture  (kbts_shape_context *Context);
+KBTS_EXPORT kbts_curve_texture    kbts_LoadCurveTexture  (kbts_shape_context *Context, kbts_u16 GlyphId);
 
 //
 // Other stuff
@@ -31981,14 +31981,14 @@ kbts__FloatToHalfPrecision(float ValueF32)
 }
 
 
-kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context)
+kbts_curve_texture kbts_LoadCurveTexture(kbts_shape_context *Context, kbts_u16 GlyphId)
 {
     kbts_curve_texture Texture = {0};
 
     kbts_arena Arena = Context->ScratchArena;
     kbts_font *Font  = Context->RunFont;
 
-    kbts__glyph Glyph = kbts__LoadGlyph(28, Font, &Arena);
+    kbts__glyph Glyph = kbts__LoadGlyph(GlyphId, Font, &Arena);
 
     kbts__glyph_point Points[1024] = {0};
     kbts_u32 GeneratedIndex = 0;
